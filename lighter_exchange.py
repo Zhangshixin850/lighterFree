@@ -279,6 +279,11 @@ class LighterExchange:
             return result
         except (ExchangeError, asyncio.CancelledError):
             raise
+        except KeyError as exc:
+            field = exc.args[0] if exc.args else ""
+            if isinstance(field, str) and field.isidentifier() and len(field) <= 64:
+                raise ExchangeError(f"接口响应缺少字段：{field}") from None
+            raise ExchangeError("接口响应缺少必要字段") from None
         except Exception as exc:
             raise ExchangeError(f"读取失败：{type(exc).__name__}") from None
 

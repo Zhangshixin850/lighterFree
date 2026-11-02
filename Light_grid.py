@@ -1,11 +1,13 @@
 """Lighter Robinhood 免费账户中性网格。运行入口会直接交易。"""
 
+import argparse
 import asyncio
 import logging
 import os
 import signal
 import sys
 import time
+import traceback
 from collections import deque
 from decimal import Decimal
 from pathlib import Path
@@ -13,12 +15,27 @@ from pathlib import Path
 from lighter_exchange import (
     BATCH_SIZE,
     REQUEST_LIMIT,
+    ExchangeError,
     FatalError,
     LighterExchange,
     number,
 )
 
 logger = logging.getLogger("light_grid")
+REQUIRED_CONFIG = (
+    "LIGHTER_ACCOUNT_INDEX",
+    "LIGHTER_API_KEY_INDEX",
+    "LIGHTER_API_PRIVATE_KEY",
+    "SYMBOL",
+    "gridStep",
+    "gridLines",
+    "orderSize",
+    "lowLimit",
+    "highLimit",
+    "baseline",
+    "left",
+    "maxposi",
+)
 
 
 class GridTrader:
@@ -389,11 +406,10 @@ class GridTrader:
         return 1 if risk_exit else 0
 
 
-async def main():
+async def main(check_config=False):
     from dotenv import load_dotenv
 
     directory = Path(__file__).resolve().parent
-    load_dotenv(directory / ".env")
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
     console = logging.StreamHandler()
@@ -404,13 +420,37 @@ async def main():
     console.setFormatter(
         logging.Formatter("%(asctime)s | %(message)s", datefmt="%H:%M:%S")
     )
-    file_log = logging.FileHandler(directory / "Light_grid.log", encoding="utf-8")
-    file_log.setLevel(logging.DEBUG)
-    file_log.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-    logger.handlers[:] = [console, file_log]
+    logger.handlers[:] = [console]
+    if not check_config:
+        file_log = logging.FileHandler(directory / "Light_grid.log", encoding="utf-8")
+        file_log.setLevel(logging.DEBUG)
+        file_log.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+        )
+        logger.handlers.append(file_log)
     exchange = None
+    config = {}
+    stage = "检查配置"
     try:
+        load_dotenv(directory / ".env", encoding="utf-8-sig")
         config = dict(os.environ)
+        # Windows 环境变量枚举会大写键名，按原配置名读取以保留 gridStep 等名称。
+        for key in (*REQUIRED_CONFIG, "leverage"):
+            value = os.getenv(key)
+            if value is not None:
+                config[key] = value
+        missing = [key for key in REQUIRED_CONFIG if not config.get(key, "").strip()]
+        if missing:
+            raise ValueError(
+                "缺少配置项："
+                + ", ".join(missing)
+                + f"；请检查 {directory / '.env'} 或系统环境变量"
+            )
+        placeholders = [
+            key for key in REQUIRED_CONFIG if config[key].startswith("YOUR_")
+        ]
+        if placeholders:
+            raise ValueError("配置项仍为占位值：" + ", ".join(placeholders))
         exchange = LighterExchange(
             config.get("LIGHTER_NETWORK", "robinhood").strip(),
             int(config["LIGHTER_ACCOUNT_INDEX"]),
@@ -418,6 +458,9 @@ async def main():
             config["LIGHTER_API_PRIVATE_KEY"].strip(),
         )
         trader = GridTrader(exchange, config)
+        if check_config:
+            logger.info("配置字段和策略参数检查通过（离线，未验证密钥有效性）")
+            return 0
         loop = asyncio.get_running_loop()
         for signum in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -426,15 +469,46 @@ async def main():
                 signal.signal(
                     signum, lambda *_: loop.call_soon_threadsafe(trader.stop_event.set)
                 )
+        stage = "初始化 SDK / 加载市场"
         await exchange.initialize(config["SYMBOL"])
         logger.info(
             "Lighter RH v1.0 | %s | %s | 批量+WebSocket",
             exchange.network,
             exchange.symbol,
         )
+        stage = "运行网格"
         return await trader.run()
     except Exception as exc:
-        logger.error("启动失败（%s）| 请检查配置、依赖及连接", type(exc).__name__)
+        if isinstance(exc, KeyError):
+            field = exc.args[0] if exc.args else ""
+            detail = (
+                f"缺少字段：{field}"
+                if isinstance(field, str) and field.isidentifier() and len(field) <= 64
+                else "缺少必要字段"
+            )
+        elif isinstance(exc, ExchangeError) or (
+            stage == "检查配置" and isinstance(exc, ValueError)
+        ):
+            detail = str(exc)
+        else:
+            detail = type(exc).__name__
+        for key, value in config.items():
+            if value and any(
+                word in key.upper()
+                for word in ("PRIVATE_KEY", "SECRET", "TOKEN", "PASSWORD", "WEBHOOK")
+            ):
+                detail = detail.replace(value, "<redacted>")
+                if value.startswith("0x") and len(value) > 16:
+                    detail = detail.replace(value[2:], "<redacted>")
+        logger.error("启动失败 | 阶段：%s | %s", stage, detail)
+        frames = traceback.extract_tb(exc.__traceback__)
+        logger.debug(
+            "失败位置：%s",
+            " -> ".join(
+                f"{Path(frame.filename).name}:{frame.lineno} {frame.name}"
+                for frame in frames
+            ),
+        )
         return 1
     finally:
         if exchange:
@@ -442,4 +516,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main()))
+    parser = argparse.ArgumentParser(description="Lighter Robinhood 永续网格")
+    parser.add_argument(
+        "--check-config", action="store_true", help="仅离线检查配置，不连接或交易"
+    )
+    sys.exit(asyncio.run(main(parser.parse_args().check_config)))

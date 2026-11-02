@@ -21,6 +21,18 @@ python Light_grid.py
 Robinhood 主网网络名为 `robinhood`，测试网为 `robinhood_testnet`；其他网络拒绝启动。
 API key 索引使用 4–156 或 158–254。`SYMBOL` 支持 `INTC` 或 `INTC/USDT:USDT`，实际请求使用匹配到的活跃永续市场 ID。
 
+### 启动排查
+
+先运行不连接交易所、不创建日志文件的配置检查：
+
+```bash
+python3 Light_grid.py --check-config
+```
+
+检查会列出缺失或仍为占位值的字段名，并验证策略参数；不会显示凭据，也不验证密钥是否在平台有效。
+从 GitHub 克隆时，真实 `.env` 不会随仓库下载，需要在 `Light_grid.py` 同目录自行配置。
+启动失败会显示阶段和缺失字段；正常启动的 `Light_grid.log` 另记代码位置，不记录局部变量或原始敏感响应。
+
 ## 交易与限速
 
 - 通过 WebSocket 接收盘口、订单、账户统计、全部永续持仓和资产更新；启动、重连后同步，正常每 `REST_INTERVAL=30` 秒核对账户和挂单。

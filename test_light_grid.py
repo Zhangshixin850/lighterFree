@@ -3,14 +3,18 @@
 import asyncio
 import inspect
 import json
+import logging
+import os
+import tempfile
 import time
 import unittest
 from collections import deque
 from decimal import Decimal
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from Light_grid import GridTrader
+from Light_grid import GridTrader, main
 
 from lighter_exchange import (
     ExchangeError,
@@ -674,6 +678,127 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         result = await trader.run()
         self.assertEqual(result, 1)
         venue.cancel_all_orders.assert_awaited_once()
+
+
+class StartupTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.config = {
+            **CONFIG,
+            "LIGHTER_ACCOUNT_INDEX": "123",
+            "LIGHTER_API_KEY_INDEX": "4",
+            "LIGHTER_API_PRIVATE_KEY": "FAKE_PRIVATE_KEY_FOR_OFFLINE_TEST",
+            "SYMBOL": "INTC",
+        }
+
+    async def test_missing_configuration_lists_names_without_credentials(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("dotenv.load_dotenv"),
+            patch("Light_grid.logger") as log,
+            patch("logging.FileHandler") as file_log,
+            patch.object(
+                LighterExchange, "initialize", new_callable=AsyncMock
+            ) as initialize,
+        ):
+            self.assertEqual(await main(check_config=True), 1)
+        detail = log.error.call_args.args[2]
+        self.assertIn("LIGHTER_ACCOUNT_INDEX", detail)
+        self.assertIn("LIGHTER_API_PRIVATE_KEY", detail)
+        self.assertIn("gridStep", detail)
+        file_log.assert_not_called()
+        initialize.assert_not_awaited()
+
+    async def test_check_config_never_connects_or_creates_log(self):
+        with (
+            patch.dict(os.environ, self.config, clear=True),
+            patch("dotenv.load_dotenv") as load,
+            patch("Light_grid.logger"),
+            patch("logging.FileHandler") as file_log,
+            patch.object(
+                LighterExchange, "initialize", new_callable=AsyncMock
+            ) as initialize,
+            patch.object(GridTrader, "run", new_callable=AsyncMock) as run,
+        ):
+            self.assertEqual(await main(check_config=True), 0)
+        self.assertEqual(load.call_args.kwargs["encoding"], "utf-8-sig")
+        file_log.assert_not_called()
+        initialize.assert_not_awaited()
+        run.assert_not_awaited()
+
+    async def test_placeholders_are_reported_by_name(self):
+        with (
+            patch.dict(
+                os.environ,
+                {**self.config, "LIGHTER_API_PRIVATE_KEY": "YOUR_PRIVATE_KEY"},
+                clear=True,
+            ),
+            patch("dotenv.load_dotenv"),
+            patch("Light_grid.logger") as log,
+        ):
+            self.assertEqual(await main(check_config=True), 1)
+        detail = log.error.call_args.args[2]
+        self.assertIn("LIGHTER_API_PRIVATE_KEY", detail)
+        self.assertNotIn("YOUR_PRIVATE_KEY", detail)
+
+    async def test_sdk_key_error_reports_stage_and_field(self):
+        with (
+            patch.dict(os.environ, self.config, clear=True),
+            patch("dotenv.load_dotenv"),
+            patch("Light_grid.logger") as log,
+            patch("logging.FileHandler", return_value=logging.NullHandler()),
+            patch("signal.signal"),
+            patch.object(
+                LighterExchange,
+                "initialize",
+                new=AsyncMock(side_effect=KeyError("market_type")),
+            ),
+        ):
+            self.assertEqual(await main(), 1)
+        self.assertEqual(log.error.call_args.args[1], "初始化 SDK / 加载市场")
+        self.assertIn("market_type", log.error.call_args.args[2])
+        self.assertNotIn(self.config["LIGHTER_API_PRIVATE_KEY"], str(log.mock_calls))
+
+    async def test_sensitive_value_is_redacted_from_configuration_error(self):
+        with (
+            patch.dict(os.environ, self.config, clear=True),
+            patch("dotenv.load_dotenv"),
+            patch("Light_grid.logger") as log,
+            patch(
+                "Light_grid.GridTrader",
+                side_effect=ValueError(self.config["LIGHTER_API_PRIVATE_KEY"]),
+            ),
+        ):
+            self.assertEqual(await main(check_config=True), 1)
+        self.assertEqual(log.error.call_args.args[2], "<redacted>")
+
+    async def test_utf8_bom_configuration_and_environment_precedence(self):
+        with tempfile.TemporaryDirectory(prefix="lighter-config-") as folder:
+            directory = Path(folder)
+            config = {**self.config, "LIGHTER_API_KEY_INDEX": "0"}
+            (directory / ".env").write_text(
+                "\n".join(f"{key}={value}" for key, value in config.items()),
+                encoding="utf-8-sig",
+            )
+            with (
+                patch.dict(os.environ, {"LIGHTER_API_KEY_INDEX": "4"}, clear=True),
+                patch("Light_grid.__file__", str(directory / "Light_grid.py")),
+                patch("Light_grid.logger"),
+                patch.object(
+                    LighterExchange, "initialize", new_callable=AsyncMock
+                ) as initialize,
+            ):
+                self.assertEqual(await main(check_config=True), 0)
+            self.assertFalse((directory / "Light_grid.log").exists())
+            initialize.assert_not_awaited()
+
+    async def test_response_key_error_identifies_missing_field(self):
+        class BrokenResponse:
+            def to_dict(self):
+                raise KeyError("orders")
+
+        venue = exchange()
+        with self.assertRaisesRegex(ExchangeError, "orders"):
+            await venue.read(AsyncMock(return_value=BrokenResponse()))
 
     async def test_account_risk_cancels_without_placing(self):
         venue = exchange()
