@@ -157,6 +157,7 @@ class LighterExchange:
         self.last_message = 0.0
         self.last_stats_at = 0.0
         self.last_reconcile = 0.0
+        self.reconcile_timeout = 60.0
         self.generation = 0
         self.reconciled_generation = -1
         self.snapshots = set()
@@ -192,7 +193,7 @@ class LighterExchange:
             and time.monotonic() - self.last_message < 30
             and time.monotonic() - self.last_stats_at < 45
             and time.monotonic() - self.last_price_at < 30
-            and time.monotonic() - self.last_reconcile < 60
+            and time.monotonic() - self.last_reconcile < self.reconcile_timeout
             and self.error is None
         )
 

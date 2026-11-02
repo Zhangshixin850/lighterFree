@@ -201,6 +201,47 @@ class StrategyTests(unittest.TestCase):
         )
         self.assertEqual([i["edge"] for i in orders], [0, 0, 0, 0, 1, 1])
 
+    def test_user_sixty_second_rest_interval_is_valid(self):
+        venue = exchange()
+        trader = GridTrader(
+            venue,
+            {
+                **CONFIG,
+                "CHECK_INTERVAL": "0.8",
+                "REST_INTERVAL": "60",
+                "DISCONNECT_TIMEOUT": "30",
+                "BATCH_SIZE": "15",
+            },
+        )
+        self.assertEqual(trader.reconcile_interval, 60)
+        self.assertEqual(venue.reconcile_timeout, 120)
+        venue.last_reconcile = 100
+        for now, expected in ((171, True), (221, False)):
+            venue.last_message = venue.last_stats_at = venue.last_price_at = now
+            with patch("lighter_exchange.time.monotonic", return_value=now):
+                self.assertEqual(venue.ready, expected)
+
+    def test_invalid_parameters_list_all_names_and_rules(self):
+        with self.assertRaises(ValueError) as caught:
+            GridTrader(
+                exchange(),
+                {**CONFIG, "gridLines": "3", "MMR": "20", "REST_INTERVAL": "5"},
+            )
+        message = str(caught.exception)
+        self.assertIn("gridLines=3", message)
+        self.assertIn("正偶数", message)
+        self.assertIn("MMR=20", message)
+        self.assertIn("REST_INTERVAL=5.0", message)
+        self.assertNotIn("DISCONNECT_TIMEOUT", message)
+
+    def test_nonfinite_rest_interval_is_rejected(self):
+        for value in ("nan", "inf", "-inf"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "REST_INTERVAL"),
+            ):
+                GridTrader(exchange(), {**CONFIG, "REST_INTERVAL": value})
+
     def test_fill_direction_price_and_reference_sort(self):
         self.trader.All_orders = {
             "1": [0, Decimal(58), "buy"],

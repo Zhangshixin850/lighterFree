@@ -3,6 +3,7 @@
 import argparse
 import asyncio
 import logging
+import math
 import os
 import signal
 import sys
@@ -59,20 +60,68 @@ class GridTrader:
         self.cancel_on_exit = config.get("CANCEL_ON_EXIT", "true").lower() == "true"
         self.cancel_on_risk = config.get("CANCEL_ON_RISK", "true").lower() == "true"
         self.critical_error_limit = int(config.get("CRITICAL_ERROR_LIMIT", "3"))
-        if (
-            self.gridLines <= 0
-            or self.gridLines % 2
-            or self.gridLines > 1000
-            or min(self.gridStep, self.orderSize, self.maxposi, self.leverage) <= 0
-            or not 0 < self.MMR <= 1
-            or not 0 < self.lowLimit < self.highLimit
-            or not 0.05 <= self.check_interval <= 5
-            or not 10 <= self.reconcile_interval <= 45
-            or not 10 <= self.disconnect_timeout <= 120
-            or not 1 <= self.batch_size <= BATCH_SIZE
-            or self.critical_error_limit <= 0
+        errors = []
+        for key, value in (
+            ("gridStep", self.gridStep),
+            ("orderSize", self.orderSize),
+            ("maxposi", self.maxposi),
+            ("leverage", self.leverage),
         ):
-            raise ValueError("网格、风控或调度参数无效，请检查 .env")
+            if value <= 0:
+                errors.append(f"{key}={value} 必须大于 0")
+        checks = (
+            (
+                "gridLines",
+                self.gridLines,
+                0 < self.gridLines <= 1000 and self.gridLines % 2 == 0,
+                "必须是 1–1000 范围内的正偶数",
+            ),
+            ("MMR", self.MMR, 0 < self.MMR <= 1, "必须满足 0 < MMR <= 1"),
+            (
+                "lowLimit/highLimit",
+                f"{self.lowLimit}/{self.highLimit}",
+                0 < self.lowLimit < self.highLimit,
+                "必须满足 0 < lowLimit < highLimit",
+            ),
+            (
+                "CHECK_INTERVAL",
+                self.check_interval,
+                0.05 <= self.check_interval <= 5,
+                "必须在 0.05–5 秒之间",
+            ),
+            (
+                "REST_INTERVAL",
+                self.reconcile_interval,
+                math.isfinite(self.reconcile_interval)
+                and self.reconcile_interval >= 10,
+                "必须是至少 10 秒的有限数值",
+            ),
+            (
+                "DISCONNECT_TIMEOUT",
+                self.disconnect_timeout,
+                10 <= self.disconnect_timeout <= 120,
+                "必须在 10–120 秒之间",
+            ),
+            (
+                "BATCH_SIZE",
+                self.batch_size,
+                1 <= self.batch_size <= BATCH_SIZE,
+                f"必须在 1–{BATCH_SIZE} 之间",
+            ),
+            (
+                "CRITICAL_ERROR_LIMIT",
+                self.critical_error_limit,
+                self.critical_error_limit > 0,
+                "必须大于 0",
+            ),
+        )
+        errors.extend(
+            f"{key}={value} {rule}" for key, value, valid, rule in checks if not valid
+        )
+        if errors:
+            raise ValueError("参数校验失败：" + "；".join(errors))
+        # 核对间隔与过期阈值配套，保留一轮读取或重试的时间。
+        self.exchange.reconcile_timeout = max(60, 2 * self.reconcile_interval)
         self.All_orders = {}
         self.last_fill_price = Decimal(0)
         self.myNewPrice = Decimal(0)
