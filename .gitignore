@@ -1,0 +1,33 @@
+# Local account credentials
+.env
+.env.*
+!.env.example
+
+# Python environments and caches
+.venv/
+.venv-*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Runtime logs and local state
+*.log
+*.pid
+*.sqlite
+*.sqlite3
+
+# Build and editor output
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.bak

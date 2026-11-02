@@ -1,0 +1,700 @@
+"""离线回归：不读取 .env，不创建真实交易客户端。"""
+
+import asyncio
+import inspect
+import json
+import time
+import unittest
+from collections import deque
+from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from Light_grid import GridTrader
+
+from lighter_exchange import (
+    ExchangeError,
+    FatalError,
+    LighterExchange,
+    RequestBudget,
+    transaction_types,
+)
+
+MARKET = {
+    "market_id": 42,
+    "symbol": "INTC",
+    "market_type": "perp",
+    "status": "active",
+    "supported_size_decimals": 1,
+    "supported_price_decimals": 2,
+    "size_decimals": 3,
+    "price_decimals": 4,
+    "min_base_amount": "0.1",
+    "min_quote_amount": "1",
+    "order_quote_limit": "100000",
+    "maintenance_margin_fraction": 100,
+}
+CONFIG = {
+    "gridStep": "1",
+    "gridLines": "6",
+    "orderSize": "1",
+    "lowLimit": "10",
+    "highLimit": "100",
+    "baseline": "60",
+    "left": "0",
+    "maxposi": "100",
+    "MAX_LOSS": "-100",
+    "MMR": "0.2",
+    "leverage": "5",
+    "CHECK_INTERVAL": "0.05",
+    "DISCONNECT_TIMEOUT": "10",
+    "CANCEL_ON_RISK": "true",
+    "CANCEL_ON_EXIT": "true",
+}
+
+
+def exchange():
+    venue = LighterExchange("robinhood", 123, 4, "FAKE_KEY")
+    venue.market = MARKET.copy()
+    venue.markets = {42: venue.market}
+    venue.symbol = "INTC"
+    venue.stats = {"portfolio_value": "1000"}
+    venue.price = Decimal(60)
+    venue.connected = True
+    venue.snapshots = {
+        "order_book",
+        "account_all_orders",
+        "account_all_positions",
+        "account_all_assets",
+        "user_stats",
+    }
+    venue.reconciled_generation = venue.generation
+    venue.last_message = venue.last_reconcile = venue.last_price_at = (
+        venue.last_stats_at
+    ) = time.monotonic()
+    venue.bids, venue.asks = {Decimal(59): Decimal(1)}, {Decimal(61): Decimal(1)}
+    venue.trading_enabled = True
+    return venue
+
+
+def raw_order(oid="1", status="open", price="59", remaining="1", amount="1", ask=False):
+    return {
+        "client_order_index": int(oid),
+        "order_index": int(oid) + 1000,
+        "status": status,
+        "price": price,
+        "remaining_base_amount": remaining,
+        "initial_base_amount": amount,
+        "is_ask": ask,
+    }
+
+
+class BudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_full_sixty_request_window_without_reserve(self):
+        now = [100.0]
+
+        async def sleep(delay):
+            now[0] += delay
+
+        budget = RequestBudget(lambda: now[0], sleep)
+        for _ in range(60):
+            await budget.acquire()
+        self.assertEqual(len(budget.requests), 60)
+        self.assertGreater(budget.delay(), 59)
+        await budget.acquire(urgent=True)
+        stamps = [stamp for stamp, _ in budget.requests]
+        self.assertLessEqual(len(stamps), 60)
+        self.assertGreaterEqual(now[0], 160.001)
+
+    async def test_children_budget_is_separate_from_http_count(self):
+        now = [100.0]
+
+        async def sleep(delay):
+            now[0] += delay
+
+        budget = RequestBudget(lambda: now[0], sleep)
+        for count in (15, 15, 10):
+            await budget.acquire(types=(14,) * count)
+        self.assertEqual(len(budget.requests), 3)
+        self.assertEqual(budget.available(14), 0)
+        self.assertGreater(budget.delay(types=(14,)), 59)
+        # 下单用满 40 笔后，撤单和读取仍可使用各自剩余额度。
+        await budget.acquire(types=(16,), urgent=True)
+        await budget.acquire()
+        self.assertEqual(len(budget.requests), 5)
+        await budget.acquire(types=(14,))
+        self.assertLessEqual(sum(n for _, n in budget.transactions[14]), 40)
+
+    async def test_partial_batch_uses_last_ten_transaction_slots(self):
+        budget = RequestBudget(lambda: 100.0, AsyncMock())
+        await budget.acquire(types=(14,) * 15)
+        await budget.acquire(types=(14,) * 15)
+        self.assertEqual(budget.available(14), 10)
+        await budget.acquire(types=(14,) * 10)
+        self.assertEqual(budget.available(14), 0)
+
+    async def test_single_cancels_only_spend_general_request_quota(self):
+        budget = RequestBudget(lambda: 100.0, AsyncMock())
+        for _ in range(4):
+            await budget.acquire(types=(15,) * 15, urgent=True)
+        self.assertEqual(len(budget.requests), 4)
+        self.assertNotIn(15, budget.transactions)
+
+    async def test_cooldown_and_control_limit(self):
+        now = [100.0]
+
+        async def sleep(delay):
+            now[0] += delay
+
+        budget = RequestBudget(lambda: now[0], sleep)
+        budget.penalize(60)
+        await budget.acquire(urgent=True)
+        self.assertGreaterEqual(now[0], 160)
+        for _ in range(200):
+            await budget.acquire(control=True)
+        self.assertGreater(budget.delay(control=True), 59)
+
+    async def test_urgent_request_gets_released_slot_before_ordinary(self):
+        now = [100.0]
+        release = asyncio.Event()
+
+        async def sleep(delay):
+            await release.wait()
+            await asyncio.sleep(0)
+
+        budget = RequestBudget(lambda: now[0], sleep)
+        for _ in range(60):
+            await budget.acquire()
+        order = []
+
+        async def request(name, urgent):
+            await budget.acquire(urgent=urgent)
+            order.append(name)
+
+        ordinary = asyncio.create_task(request("ordinary", False))
+        urgent = asyncio.create_task(request("urgent", True))
+        await asyncio.sleep(0)
+        now[0] = 160.002
+        release.set()
+        await asyncio.wait_for(asyncio.gather(ordinary, urgent), timeout=1)
+        self.assertEqual(order, ["urgent", "ordinary"])
+        self.assertEqual(budget.urgent_waiters, 0)
+
+
+class StrategyTests(unittest.TestCase):
+    def setUp(self):
+        self.venue = exchange()
+        self.trader = GridTrader(self.venue, CONFIG)
+        self.trader.myNewPrice = Decimal(60)
+        self.trader.switc = False
+
+    def test_grid_symmetric_and_outer_edges(self):
+        self.trader.build_grid()
+        orders = list(self.trader.queue)
+        self.assertEqual(
+            [i["order"]["price"] for i in orders],
+            list(map(Decimal, (59, 61, 58, 62, 57, 63))),
+        )
+        self.assertEqual([i["edge"] for i in orders], [0, 0, 0, 0, 1, 1])
+
+    def test_fill_direction_price_and_reference_sort(self):
+        self.trader.All_orders = {
+            "1": [0, Decimal(58), "buy"],
+            "2": [0, Decimal(61), "sell"],
+        }
+        self.venue.update_order(raw_order("1", "filled", "58", "0"))
+        self.venue.update_order(raw_order("2", "filled", "61", "0", ask=True))
+        self.trader.replacements()
+        orders = list(self.trader.queue)
+        self.assertEqual([i["origin"] for i in orders], ["2", "1"])
+        self.assertEqual(
+            [(i["order"]["side"], i["order"]["price"]) for i in orders],
+            [("buy", Decimal(60)), ("sell", Decimal(59))],
+        )
+        self.trader.replacements()
+        self.assertEqual(len(self.trader.queue), 2)
+
+    def test_edge_wins_over_regular_fill(self):
+        self.trader.All_orders = {
+            "1": [0, Decimal(59), "buy"],
+            "2": [1, Decimal(57), "buy"],
+        }
+        self.venue.update_order(raw_order("1", "filled", remaining="0"))
+        self.venue.update_order(raw_order("2", "filled", "57", "0"))
+        self.trader.replacements()
+        self.assertTrue(self.trader.switc)
+        self.assertEqual(self.trader.myNewPrice, Decimal(57))
+        self.assertFalse(self.trader.queue)
+
+    def test_partial_cancellation_replaces_full_quantity(self):
+        self.trader.All_orders = {"1": [1, Decimal(57), "buy"]}
+        self.venue.update_order(raw_order("1", "canceled-expired", "57", "0.4"))
+        self.trader.replacements()
+        item = self.trader.queue[0]
+        self.assertEqual(item["order"]["amount"], Decimal(1))
+        self.assertEqual(item["order"]["price"], Decimal(57))
+        self.assertEqual(item["edge"], 1)
+        self.assertFalse(self.trader.switc)
+
+    def test_unknown_status_does_not_replace(self):
+        self.trader.All_orders = {"1": [0, Decimal(59), "buy"]}
+        self.trader.replacements()
+        self.assertFalse(self.trader.queue)
+
+    def test_atomic_local_replacement_and_no_duplicate_fill(self):
+        self.trader.All_orders = {"1": [0, Decimal(59), "buy"]}
+        self.venue.update_order(raw_order("1", "filled", remaining="0"))
+        self.trader.replacements()
+        self.trader.batch = list(self.trader.queue)
+        self.trader.queue.clear()
+        self.trader.operation = SimpleNamespace(result=lambda: None)
+        self.trader.operation_kind = "create"
+        self.trader.finish_operation()
+        self.assertNotIn("1", self.trader.All_orders)
+        self.assertEqual(self.trader.last_fill_price, 59)
+        self.assertEqual(self.trader.counter, 1)
+        self.trader.replacements()
+        self.assertFalse(self.trader.queue)
+
+    def test_low_order_count_is_not_a_risk(self):
+        self.assertEqual(self.trader.risk_reason(), "")
+
+    def test_account_risk_uses_all_markets_and_thresholds(self):
+        self.venue.markets[43] = {
+            **MARKET,
+            "market_id": 43,
+            "maintenance_margin_fraction": 1000,
+        }
+        self.venue.positions = {
+            "42": {
+                "position": "1",
+                "position_value": "1000",
+                "sign": 1,
+                "unrealized_pnl": "0",
+            },
+            "43": {
+                "position": "1",
+                "position_value": "1900",
+                "sign": -1,
+                "unrealized_pnl": "0",
+            },
+        }
+        self.assertEqual(self.venue.metrics()["mmr"], Decimal("0.2"))
+        self.assertIn("保证金率", self.trader.risk_reason())
+        self.venue.positions = {
+            "42": {
+                "position": "1",
+                "position_value": "5000",
+                "sign": 1,
+                "unrealized_pnl": "0",
+            }
+        }
+        self.assertIn("杠杆", self.trader.risk_reason())
+
+    def test_unified_equity_is_not_double_counted(self):
+        self.venue.stats = {
+            "account_trading_mode": 1,
+            "portfolio_value": "99999",
+            "total_stats": {"portfolio_value": "1000"},
+        }
+        self.venue.positions = {
+            "42": {
+                "position": "1",
+                "position_value": "2000",
+                "sign": 1,
+                "unrealized_pnl": "100",
+            }
+        }
+        self.assertEqual(self.venue.metrics()["equity"], 1000)
+        self.assertEqual(self.venue.metrics()["leverage"], 2)
+        self.venue.stats["total_stats"] = {}
+        with self.assertRaises(ValueError):
+            self.venue.metrics()
+
+    def test_missing_risk_fields_and_nonpositive_equity_fail(self):
+        self.venue.stats = {}
+        with self.assertRaises(KeyError):
+            self.venue.metrics()
+        self.venue.stats = {"portfolio_value": "0"}
+        with self.assertRaises(FatalError):
+            self.venue.metrics()
+
+
+class StreamTests(unittest.TestCase):
+    def test_book_snapshot_delta_and_sequence_gap(self):
+        venue = exchange()
+        venue.apply_message(
+            {
+                "type": "subscribed/order_book",
+                "order_book": {
+                    "nonce": 10,
+                    "bids": [{"price": "59", "size": "1"}],
+                    "asks": [{"price": "61", "size": "1"}],
+                },
+            }
+        )
+        venue.apply_message(
+            {
+                "type": "update/order_book",
+                "order_book": {
+                    "begin_nonce": 10,
+                    "nonce": 20,
+                    "bids": [
+                        {"price": "59", "size": "0"},
+                        {"price": "58", "size": "1"},
+                    ],
+                    "asks": [],
+                },
+            }
+        )
+        self.assertEqual(venue.price, Decimal("59.50"))
+        with self.assertRaises(ExchangeError):
+            venue.apply_message(
+                {
+                    "type": "update/order_book",
+                    "order_book": {"begin_nonce": 19, "nonce": 30},
+                }
+            )
+
+    def test_terminal_cannot_be_reverted_by_stale_open(self):
+        venue = exchange()
+        venue.update_order(raw_order(status="filled", remaining="0"))
+        venue.update_order(raw_order())
+        self.assertEqual(venue.orders["1"]["status"], "filled")
+
+    def test_position_snapshot_and_incremental_semantics(self):
+        venue = exchange()
+        venue.positions = {"42": {"position": "1"}}
+        venue.apply_message({"type": "update/account_all_positions", "positions": {}})
+        self.assertIn("42", venue.positions)
+        venue.apply_message(
+            {"type": "subscribed/account_all_positions", "positions": {}}
+        )
+        self.assertEqual(venue.positions, {})
+
+    def test_reconnect_needs_new_snapshots_and_reconciliation(self):
+        venue = exchange()
+        self.assertTrue(venue.ready)
+        venue.generation += 1
+        self.assertFalse(venue.ready)
+        venue.reconciled_generation = venue.generation
+        venue.snapshots.clear()
+        self.assertFalse(venue.ready)
+
+
+class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_initialization_maps_symbol_and_wraps_real_request_boundary(self):
+        import lighter
+
+        venue = LighterExchange("robinhood", 123, 4, "FAKE_KEY")
+        transport = SimpleNamespace(request=AsyncMock(), retry_client=None)
+        original = transport.request
+
+        async def details():
+            await transport.request(
+                "GET", "https://api.rh.lighter.xyz/api/v1/orderBookDetails"
+            )
+            return {"code": 200, "order_book_details": [MARKET]}
+
+        client = SimpleNamespace(
+            api_client=SimpleNamespace(rest_client=transport),
+            order_api=SimpleNamespace(order_book_details=details),
+        )
+        with (
+            patch.object(lighter, "SignerClient", return_value=client),
+            patch.object(lighter, "AccountApi", return_value=object()),
+            patch.object(venue, "websocket", new=AsyncMock()),
+        ):
+            await venue.initialize("INTC/USDT:USDT")
+        self.assertEqual(venue.symbol, "INTC")
+        self.assertEqual(len(venue.budget.requests), 1)
+        await asyncio.gather(venue._ws_task)
+        # 即使已准备好订单，预算等待结束后也必须重新检查风险。
+        sample = exchange()
+        venue.connected = True
+        venue.snapshots = sample.snapshots
+        venue.reconciled_generation = venue.generation
+        now = time.monotonic()
+        venue.last_message = venue.last_stats_at = venue.last_reconcile = (
+            venue.last_price_at
+        ) = now
+        venue.trading_enabled = True
+        venue.before_send = lambda: "模拟发送前风险超限"
+        token = transaction_types.set((14,))
+        try:
+            with self.assertRaises(FatalError):
+                await transport.request(
+                    "POST", "https://api.rh.lighter.xyz/api/v1/sendTxBatch"
+                )
+        finally:
+            transaction_types.reset(token)
+        original.assert_awaited_once()
+
+    async def test_batch_signing_uses_native_scales_and_sequential_nonces(self):
+        venue = exchange()
+        venue._nonce, venue._nonce_generation = 100, venue.generation
+        signatures = []
+
+        def sign(**kwargs):
+            signatures.append(kwargs)
+            return 14, json.dumps(kwargs), "tx" + str(kwargs["nonce"]), None
+
+        orders = [
+            venue.prepare_order("buy", "0.29", "59.126"),
+            venue.prepare_order("sell", "0.2", "61"),
+        ]
+
+        async def send(types, infos):
+            for order in orders:
+                venue.update_order(
+                    raw_order(
+                        order["id"],
+                        "open",
+                        str(order["price"]),
+                        str(order["amount"]),
+                        str(order["amount"]),
+                    )
+                )
+            return SimpleNamespace(code=200)
+
+        venue.client = SimpleNamespace(
+            sign_create_order=sign,
+            send_tx_batch=AsyncMock(side_effect=send),
+            ORDER_TYPE_LIMIT=0,
+            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME=1,
+            DEFAULT_28_DAY_ORDER_EXPIRY=-1,
+        )
+        await venue.create_orders(orders)
+        self.assertEqual([s["nonce"] for s in signatures], [100, 101])
+        self.assertEqual(signatures[0]["base_amount"], 200)
+        self.assertEqual(signatures[0]["price"], 591300)
+        self.assertEqual(venue.client.send_tx_batch.await_count, 1)
+
+    async def test_uncertain_submit_never_resends(self):
+        venue = exchange()
+        venue._nonce, venue._nonce_generation = 100, venue.generation
+        order = venue.prepare_order("buy", 1, 59)
+        venue.client = SimpleNamespace(
+            sign_create_order=lambda **kwargs: (14, "{}", "tx100", None),
+            send_tx_batch=AsyncMock(side_effect=TimeoutError()),
+            ORDER_TYPE_LIMIT=0,
+            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME=1,
+            DEFAULT_28_DAY_ORDER_EXPIRY=-1,
+        )
+        venue.reconcile = AsyncMock()
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(FatalError):
+                await venue.create_orders([order])
+        self.assertEqual(venue.client.send_tx_batch.await_count, 1)
+        self.assertGreaterEqual(venue.reconcile.await_count, 1)
+
+    async def test_market_cancel_is_filtered_single_transaction_and_confirmed(self):
+        venue = exchange()
+        venue._nonce, venue._nonce_generation = 100, venue.generation
+        venue.client = SimpleNamespace(
+            sign_cancel_all_orders=lambda **kwargs: (
+                16,
+                json.dumps(kwargs),
+                "cancel100",
+                None,
+            ),
+            send_tx_batch=AsyncMock(return_value=SimpleNamespace(code=200)),
+            CANCEL_ALL_TIF_IMMEDIATE=0,
+        )
+        venue.fetch_orders = AsyncMock(return_value=[])
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            await venue.cancel_all_orders()
+        types, infos = venue.client.send_tx_batch.await_args.args
+        self.assertEqual(types, [16])
+        self.assertEqual(json.loads(infos[0])["cancel_all_market_index"], 42)
+        self.assertEqual(json.loads(infos[0])["skip_nonce"], 1)
+        venue.fetch_orders.assert_awaited()
+
+    async def test_inactive_pagination_and_unknown_order(self):
+        venue = exchange()
+        account = {"code": 200, "accounts": [{"index": 123, "positions": []}]}
+        pages = deque(
+            [
+                {"code": 200, "orders": [], "next_cursor": "page2"},
+                {
+                    "code": 200,
+                    "orders": [raw_order("1", "filled", remaining="0")],
+                    "next_cursor": "",
+                },
+            ]
+        )
+
+        async def read(method, **kwargs):
+            return account if method == "account" else pages.popleft()
+
+        venue.account_api = SimpleNamespace(account="account")
+        venue.client = SimpleNamespace(
+            order_api=SimpleNamespace(account_inactive_orders="inactive")
+        )
+        venue.auth_token = lambda: "FAKE_TOKEN"
+        venue.read = read
+        venue.fetch_orders = AsyncMock(return_value=[])
+        await venue.reconcile(["1", "2"])
+        self.assertEqual(venue.orders["1"]["status"], "filled")
+        self.assertNotIn("2", venue.orders)
+
+    async def test_sdk_signatures_without_constructing_trading_client(self):
+        from importlib.metadata import version
+
+        import lighter
+
+        self.assertEqual(version("lighter-sdk"), "1.1.8")
+        parameters = inspect.signature(
+            lighter.SignerClient.sign_cancel_all_orders
+        ).parameters
+        self.assertIn("cancel_all_market_index", parameters)
+        self.assertIn("skip_nonce", parameters)
+        self.assertEqual(lighter.get_endpoint_profile("robinhood").chain_id, 466324)
+
+    async def test_active_snapshot_does_not_overwrite_concurrent_fill(self):
+        venue = exchange()
+        venue.update_order(raw_order())
+
+        async def read(*args, **kwargs):
+            venue.update_order(raw_order(status="filled", remaining="0"))
+            return {"code": 200, "orders": [raw_order()]}
+
+        venue.client = SimpleNamespace(
+            order_api=SimpleNamespace(account_active_orders="active")
+        )
+        venue.auth_token = lambda: "FAKE_TOKEN"
+        venue.read = read
+        await venue.fetch_orders()
+        self.assertEqual(venue.orders["1"]["status"], "filled")
+
+    async def test_missing_active_order_is_not_labeled_filled(self):
+        venue = exchange()
+        venue.update_order(raw_order())
+        venue.client = SimpleNamespace(
+            order_api=SimpleNamespace(account_active_orders="active")
+        )
+        venue.auth_token = lambda: "FAKE_TOKEN"
+        venue.read = AsyncMock(return_value={"code": 200, "orders": []})
+        await venue.fetch_orders()
+        self.assertNotIn("1", venue.orders)
+
+    async def test_repeated_history_cursor_fails_closed(self):
+        venue = exchange()
+        venue.account_api = SimpleNamespace(account="account")
+        venue.client = SimpleNamespace(
+            order_api=SimpleNamespace(account_inactive_orders="inactive")
+        )
+        venue.auth_token = lambda: "FAKE_TOKEN"
+        venue.fetch_orders = AsyncMock(return_value=[])
+
+        async def read(method, **kwargs):
+            if method == "account":
+                return {"code": 200, "accounts": [{"index": 123, "positions": []}]}
+            return {"code": 200, "orders": [], "next_cursor": "same"}
+
+        venue.read = read
+        with self.assertRaises(FatalError):
+            await venue.reconcile(["unknown"])
+
+    async def test_late_confirmation_on_last_lookup_is_accepted(self):
+        venue = exchange()
+        venue._nonce, venue._nonce_generation = 100, venue.generation
+        order = venue.prepare_order("buy", 1, 59)
+        venue.client = SimpleNamespace(
+            sign_create_order=lambda **kwargs: (14, "{}", "tx100", None),
+            send_tx_batch=AsyncMock(return_value=SimpleNamespace(code=200)),
+            ORDER_TYPE_LIMIT=0,
+            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME=1,
+            DEFAULT_28_DAY_ORDER_EXPIRY=-1,
+        )
+        lookups = []
+
+        async def reconcile(ids):
+            lookups.append(ids)
+            if len(lookups) == 4:
+                venue.update_order(raw_order(order["id"]))
+
+        venue.reconcile = reconcile
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            await venue.create_orders([order])
+        self.assertEqual(len(lookups), 4)
+
+    async def test_rejected_submission_does_not_continue_with_new_orders(self):
+        venue = exchange()
+        venue._nonce, venue._nonce_generation = 100, venue.generation
+        venue.client = SimpleNamespace(
+            sign_create_order=lambda **kwargs: (14, "{}", "tx100", None),
+            send_tx_batch=AsyncMock(return_value=SimpleNamespace(code=23000)),
+            ORDER_TYPE_LIMIT=0,
+            ORDER_TIME_IN_FORCE_GOOD_TILL_TIME=1,
+            DEFAULT_28_DAY_ORDER_EXPIRY=-1,
+        )
+        with self.assertRaises(FatalError):
+            await venue.create_orders([venue.prepare_order("buy", 1, 59)])
+        self.assertIsNone(venue._nonce)
+        self.assertGreater(venue.budget.cooldown, time.monotonic())
+
+
+class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_run_builds_chunks_then_cancels_current_market_on_stop(self):
+        venue = exchange()
+        trader = GridTrader(venue, {**CONFIG, "BATCH_SIZE": "2"})
+        trader._next_sync = time.monotonic() + 30
+        chunks = []
+
+        async def create(orders):
+            chunks.append(orders)
+            for order in orders:
+                venue.update_order(
+                    raw_order(
+                        order["id"],
+                        price=str(order["price"]),
+                        ask=order["side"] == "sell",
+                    )
+                )
+            if sum(map(len, chunks)) == trader.gridLines:
+                trader.stop_event.set()
+
+        async def cancel():
+            venue.orders.clear()
+
+        venue.create_orders = create
+        venue.cancel_all_orders = AsyncMock(side_effect=cancel)
+        result = await asyncio.wait_for(trader.run(), timeout=3)
+        self.assertEqual(result, 0)
+        self.assertEqual([len(chunk) for chunk in chunks], [2, 2, 2])
+        self.assertEqual(venue.cancel_all_orders.await_count, 2)
+
+    async def test_disconnect_timeout_cancels_and_exits(self):
+        venue = exchange()
+        venue.connected = False
+        trader = GridTrader(venue, CONFIG)
+        trader._unhealthy_since = time.monotonic() - 11
+        venue.cancel_all_orders = AsyncMock()
+        result = await trader.run()
+        self.assertEqual(result, 1)
+        venue.cancel_all_orders.assert_awaited_once()
+
+    async def test_account_risk_cancels_without_placing(self):
+        venue = exchange()
+        venue.stats = {"portfolio_value": "10"}
+        venue.positions = {
+            "42": {
+                "position": "1",
+                "position_value": "60",
+                "sign": 1,
+                "unrealized_pnl": "0",
+            }
+        }
+        trader = GridTrader(venue, CONFIG)
+        trader._next_sync = time.monotonic() + 30
+        venue.create_orders = AsyncMock()
+        venue.cancel_all_orders = AsyncMock()
+        result = await trader.run()
+        self.assertEqual(result, 1)
+        venue.create_orders.assert_not_awaited()
+        venue.cancel_all_orders.assert_awaited_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

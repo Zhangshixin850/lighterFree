@@ -1,0 +1,4 @@
+# Ubuntu Python 3.10+；独立虚拟环境，不依赖 CCXT。
+lighter-sdk==1.1.8
+websockets>=14,<16
+python-dotenv>=1.2.2,<2
