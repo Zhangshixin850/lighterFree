@@ -16,6 +16,7 @@ REQUEST_LIMIT = 60
 TX_TYPE_LIMIT = 40
 CONTROL_LIMIT = 200
 BATCH_SIZE = 15  # 官方 HTTP 批量建议大小，避免 CDN 正文限制。
+API_BATCH_LIMIT = 50  # 平台单次批量容量，不限制用户配置的 patch。
 WINDOW_SECONDS = 60.001
 
 
@@ -86,14 +87,14 @@ class RequestBudget:
     def available(self, kind):
         self.delay()
         if kind == 15:
-            return BATCH_SIZE
+            return API_BATCH_LIMIT
         return max(
             0, TX_TYPE_LIMIT - sum(n for _, n in self.transactions.get(kind, ()))
         )
 
     async def acquire(self, types=(), urgent=False, control=False):
-        if len(types) > BATCH_SIZE:
-            raise ValueError("批量超过 HTTP 单批大小")
+        if len(types) > API_BATCH_LIMIT:
+            raise ValueError("批量超过平台单次容量")
         if urgent and not control:
             self.urgent_waiters += 1
         try:
@@ -699,6 +700,8 @@ class LighterExchange:
         orders, cancel_ids = orders or [], cancel_ids or []
         if not 1 <= len(orders) + len(cancel_ids) + int(cancel_market) <= self.batch_size:
             raise ValueError(f"批量交易数量必须为 1–{self.batch_size}（patch）")
+        if len(orders) + len(cancel_ids) + int(cancel_market) > API_BATCH_LIMIT:
+            raise ValueError(f"单次批量超过平台容量 {API_BATCH_LIMIT}")
         async with self._sender:
             if not urgent and not self.trading_enabled:
                 raise ExchangeError("连接或风控状态不允许新交易")
@@ -827,9 +830,10 @@ class LighterExchange:
     async def cancel_orders(self, ids):
         token = urgent_request.set(True)
         try:
-            for index in range(0, len(ids), self.batch_size):
+            count = min(self.batch_size, API_BATCH_LIMIT)
+            for index in range(0, len(ids), count):
                 await self._submit(
-                    cancel_ids=ids[index : index + self.batch_size], urgent=True
+                    cancel_ids=ids[index : index + count], urgent=True
                 )
         finally:
             urgent_request.reset(token)

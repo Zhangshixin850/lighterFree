@@ -14,8 +14,10 @@ from decimal import Decimal
 from pathlib import Path
 
 from lighter_exchange import (
+    API_BATCH_LIMIT,
     BATCH_SIZE,
     REQUEST_LIMIT,
+    TX_TYPE_LIMIT,
     ExchangeError,
     FatalError,
     LighterExchange,
@@ -61,7 +63,7 @@ class GridTrader:
                 config.get("patch", config.get("BATCH_SIZE", str(BATCH_SIZE)))
             )
         except (TypeError, ValueError):
-            raise ValueError(f"patch 必须是 1–{BATCH_SIZE} 之间的整数") from None
+            raise ValueError("patch 必须是正整数") from None
         self.cancel_on_exit = config.get("CANCEL_ON_EXIT", "true").lower() == "true"
         self.cancel_on_risk = config.get("CANCEL_ON_RISK", "true").lower() == "true"
         self.critical_error_limit = int(config.get("CRITICAL_ERROR_LIMIT", "3"))
@@ -110,8 +112,8 @@ class GridTrader:
             (
                 "patch",
                 self.batch_size,
-                1 <= self.batch_size <= BATCH_SIZE,
-                f"必须在 1–{BATCH_SIZE} 之间",
+                self.batch_size > 0,
+                "必须是正整数",
             ),
             (
                 "CRITICAL_ERROR_LIMIT",
@@ -404,8 +406,9 @@ class GridTrader:
                             available = self.exchange.budget.available(14)
                             count = min(
                                 self.batch_size,
+                                API_BATCH_LIMIT,
                                 len(self.queue),
-                                available or self.batch_size,
+                                available or TX_TYPE_LIMIT,
                             )
                             self.batch = [self.queue.popleft() for _ in range(count)]
                             self.operation_kind = "create"

@@ -94,6 +94,18 @@ def raw_order(oid="1", status="open", price="59", remaining="1", amount="1", ask
 
 
 class BudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_larger_batches_keep_request_and_transaction_limits(self):
+        budget = RequestBudget(lambda: 100.0, AsyncMock())
+        await budget.acquire(types=(14,) * 20)
+        self.assertEqual(budget.available(14), 20)
+        await budget.acquire(types=(14,) * 20)
+        self.assertEqual(budget.available(14), 0)
+        self.assertEqual(len(budget.requests), 2)
+        await budget.acquire(types=(15,) * 50, urgent=True)
+        self.assertEqual(len(budget.requests), 3)
+        with self.assertRaisesRegex(ValueError, "平台单次容量"):
+            await budget.acquire(types=(15,) * 51)
+
     async def test_full_sixty_request_window_without_reserve(self):
         now = [100.0]
 
@@ -207,13 +219,15 @@ class StrategyTests(unittest.TestCase):
             ({"BATCH_SIZE": "3"}, 3),
             ({"patch": "2", "BATCH_SIZE": "bad"}, 2),
             ({"patch": "1"}, 1),
+            ({"patch": "20"}, 20),
+            ({"patch": "100000"}, 100000),
         ):
             with self.subTest(extra=extra):
                 venue = exchange()
                 trader = GridTrader(venue, {**CONFIG, **extra})
                 self.assertEqual(trader.batch_size, expected)
                 self.assertEqual(venue.batch_size, expected)
-        for value in ("0", "16", "-1", "1.5", "", "bad"):
+        for value in ("0", "-1", "1.5", "", "bad"):
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "patch"):
                 GridTrader(exchange(), {**CONFIG, "patch": value})
 
@@ -496,6 +510,32 @@ class StreamTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_patch_twenty_submits_one_twenty_order_batch(self):
+        venue = exchange()
+        GridTrader(venue, {**CONFIG, "patch": "20"})
+        venue._nonce, venue._nonce_generation = 100, venue.generation
+        orders = [venue.prepare_order("buy", 1, 59) for _ in range(20)]
+        nonces = []
+
+        def sign(**kwargs):
+            nonces.append(kwargs["nonce"])
+            return 14, "{}", str(kwargs["nonce"]), None
+
+        async def send(types, infos):
+            self.assertEqual(len(types), 20)
+            for order in orders:
+                venue.update_order(raw_order(order["id"]))
+            return SimpleNamespace(code=200)
+
+        venue.client = SimpleNamespace(
+            sign_create_order=sign, send_tx_batch=AsyncMock(side_effect=send),
+            ORDER_TYPE_LIMIT=0, ORDER_TIME_IN_FORCE_GOOD_TILL_TIME=1,
+            DEFAULT_28_DAY_ORDER_EXPIRY=-1,
+        )
+        await venue.create_orders(orders)
+        self.assertEqual(venue.client.send_tx_batch.await_count, 1)
+        self.assertEqual(nonces, list(range(100, 120)))
+
     async def test_push_during_wait_skips_rest_and_counts_immediate_fill(self):
         venue = exchange()
         venue._nonce, venue._nonce_generation = 100, venue.generation
@@ -537,6 +577,15 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(call.kwargs["urgent"] for call in venue._submit.await_args_list))
         with self.assertRaisesRegex(ValueError, "patch"):
             await submit(orders=[{}, {}, {}])
+        GridTrader(venue, {**CONFIG, "patch": "100000"})
+        venue._submit.reset_mock()
+        await venue.cancel_orders([str(i) for i in range(105)])
+        self.assertEqual(
+            [len(call.kwargs["cancel_ids"]) for call in venue._submit.await_args_list],
+            [50, 50, 5],
+        )
+        with self.assertRaisesRegex(ValueError, "平台容量"):
+            await submit(orders=[{}] * 51)
 
     async def test_initialization_maps_symbol_and_wraps_real_request_boundary(self):
         import lighter
@@ -931,6 +980,23 @@ class QueryTests(unittest.IsolatedAsyncioTestCase):
 
 
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
+    async def test_large_patch_splits_grid_even_when_quota_is_exhausted(self):
+        venue = exchange()
+        trader = GridTrader(venue, {**CONFIG, "gridLines": "60", "patch": "100000"})
+        trader._next_sync = time.monotonic() + 30
+        venue.budget.available = lambda kind: 0
+        chunks = []
+
+        async def create(orders):
+            chunks.append(len(orders))
+            if sum(chunks) == trader.gridLines:
+                trader.stop_event.set()
+
+        venue.create_orders = create
+        venue.cancel_all_orders = AsyncMock()
+        self.assertEqual(await asyncio.wait_for(trader.run(), timeout=3), 0)
+        self.assertEqual(chunks, [40, 20])
+
     async def test_run_builds_chunks_then_cancels_current_market_on_stop(self):
         venue = exchange()
         trader = GridTrader(venue, {**CONFIG, "patch": "2"})
