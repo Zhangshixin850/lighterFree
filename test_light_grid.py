@@ -201,6 +201,54 @@ class StrategyTests(unittest.TestCase):
         )
         self.assertEqual([i["edge"] for i in orders], [0, 0, 0, 0, 1, 1])
 
+    def test_patch_default_legacy_precedence_and_validation(self):
+        for extra, expected in (
+            ({}, 15),
+            ({"BATCH_SIZE": "3"}, 3),
+            ({"patch": "2", "BATCH_SIZE": "bad"}, 2),
+            ({"patch": "1"}, 1),
+        ):
+            with self.subTest(extra=extra):
+                venue = exchange()
+                trader = GridTrader(venue, {**CONFIG, **extra})
+                self.assertEqual(trader.batch_size, expected)
+                self.assertEqual(venue.batch_size, expected)
+        for value in ("0", "16", "-1", "1.5", "", "bad"):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "patch"):
+                GridTrader(exchange(), {**CONFIG, "patch": value})
+
+    def test_googl_grid_meets_minimum_notional_at_both_limits(self):
+        venue = exchange()
+        venue.market.update(
+            supported_size_decimals=4, supported_price_decimals=2,
+            min_base_amount="0.02", min_quote_amount="10",
+        )
+        config = {
+            **CONFIG, "gridLines": "40", "gridStep": "0.04", "orderSize": "0.04",
+            "lowLimit": "251", "highLimit": "400", "baseline": "280",
+        }
+        trader = GridTrader(venue, config)
+        trader.validate_market()
+        for center in (251, 400):
+            trader.myNewPrice = Decimal(center)
+            trader.build_grid()
+            self.assertEqual(len(trader.queue), 40)
+            self.assertTrue(all(
+                item["order"]["price"] * item["order"]["amount"] >= 10
+                for item in trader.queue
+            ))
+        invalid = GridTrader(venue, {**config, "lowLimit": "200"})
+        with self.assertRaisesRegex(ValueError, "最小值"):
+            invalid.validate_market()
+
+    def test_display_reports_fills_without_requests(self):
+        self.venue.filled_count = 7
+        with patch("Light_grid.logger") as log:
+            self.trader.display()
+        message, *args = log.info.call_args.args
+        self.assertIn("成交 7 笔", message % tuple(args))
+        self.assertEqual(len(self.venue.budget.requests), 0)
+
     def test_user_sixty_second_rest_interval_is_valid(self):
         venue = exchange()
         trader = GridTrader(
@@ -264,12 +312,15 @@ class StrategyTests(unittest.TestCase):
             "1": [0, Decimal(59), "buy"],
             "2": [1, Decimal(57), "buy"],
         }
+        self.venue._strategy_order_ids.update({"1", "2"})
         self.venue.update_order(raw_order("1", "filled", remaining="0"))
         self.venue.update_order(raw_order("2", "filled", "57", "0"))
         self.trader.replacements()
         self.assertTrue(self.trader.switc)
         self.assertEqual(self.trader.myNewPrice, Decimal(57))
         self.assertFalse(self.trader.queue)
+        self.assertEqual(self.venue.filled_count, 2)
+        self.assertEqual(self.trader.counter, 0)
 
     def test_partial_cancellation_replaces_full_quantity(self):
         self.trader.All_orders = {"1": [1, Decimal(57), "buy"]}
@@ -366,6 +417,23 @@ class StrategyTests(unittest.TestCase):
 
 
 class StreamTests(unittest.TestCase):
+    def test_fill_count_is_owned_complete_and_deduplicated(self):
+        venue = exchange()
+        venue._strategy_order_ids.update({"1", "2"})
+        venue.update_order(raw_order("1", remaining="0.4"))
+        venue.update_order(raw_order("2", "canceled", remaining="0.4"))
+        venue.update_order(raw_order("3", "filled", remaining="0"))  # 手动/旧单
+        self.assertEqual(venue.filled_count, 0)
+        filled = raw_order("1", "filled", remaining="0")
+        venue.update_order(filled)
+        venue.generation += 1
+        venue.apply_message({"type": "subscribed/account_all_orders", "orders": {"42": [filled]}})
+        venue.orders.pop("1")  # 本地终态清理后，重复快照仍不能重复计数。
+        venue.update_order(filled)
+        self.assertEqual(venue.filled_count, 1)
+        self.assertFalse(venue._strategy_order_ids)
+        self.assertEqual(exchange().filled_count, 0)
+
     def test_book_snapshot_delta_and_sequence_gap(self):
         venue = exchange()
         venue.apply_message(
@@ -428,6 +496,48 @@ class StreamTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_push_during_wait_skips_rest_and_counts_immediate_fill(self):
+        venue = exchange()
+        venue._nonce, venue._nonce_generation = 100, venue.generation
+        order = venue.prepare_order("buy", 1, 59)
+        venue.client = SimpleNamespace(
+            sign_create_order=lambda **kwargs: (14, "{}", "tx100", None),
+            send_tx_batch=AsyncMock(return_value=SimpleNamespace(code=200)),
+            ORDER_TYPE_LIMIT=0, ORDER_TIME_IN_FORCE_GOOD_TILL_TIME=1,
+            DEFAULT_28_DAY_ORDER_EXPIRY=-1,
+        )
+        venue.reconcile = AsyncMock()
+
+        async def receive_fill(delay):
+            self.assertIn(order["id"], venue._strategy_order_ids)
+            venue.update_order(raw_order(order["id"], "filled", remaining="0"))
+
+        with patch("lighter_exchange.asyncio.sleep", side_effect=receive_fill):
+            await venue.create_orders([order])
+        venue.reconcile.assert_not_awaited()
+        self.assertEqual(venue.client.send_tx_batch.await_count, 1)
+        self.assertEqual(venue.filled_count, 1)
+
+        # 后续补单签名失败，不回退已经确认的成交数。
+        venue.client.sign_create_order = lambda **kwargs: (14, "{}", "bad", "error")
+        with self.assertRaises(FatalError):
+            await venue.create_orders([venue.prepare_order("sell", 1, 60)])
+        self.assertEqual(venue.filled_count, 1)
+
+    async def test_patch_limits_cancel_chunks_and_direct_submit(self):
+        venue = exchange()
+        GridTrader(venue, {**CONFIG, "patch": "2"})
+        submit = venue._submit
+        venue._submit = AsyncMock()
+        await venue.cancel_orders(["1", "2", "3", "4", "5"])
+        self.assertEqual(
+            [call.kwargs["cancel_ids"] for call in venue._submit.await_args_list],
+            [["1", "2"], ["3", "4"], ["5"]],
+        )
+        self.assertTrue(all(call.kwargs["urgent"] for call in venue._submit.await_args_list))
+        with self.assertRaisesRegex(ValueError, "patch"):
+            await submit(orders=[{}, {}, {}])
+
     async def test_initialization_maps_symbol_and_wraps_real_request_boundary(self):
         import lighter
 
@@ -654,7 +764,8 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         )
         lookups = []
 
-        async def reconcile(ids):
+        async def reconcile(ids, *, force_history=False):
+            self.assertTrue(force_history)
             lookups.append(ids)
             if len(lookups) == 4:
                 venue.update_order(raw_order(order["id"]))
@@ -680,10 +791,149 @@ class AdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(venue.budget.cooldown, time.monotonic())
 
 
+class QueryTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.venue = exchange()
+        self.venue.account_api = SimpleNamespace(account="account")
+        self.venue.client = SimpleNamespace(
+            order_api=SimpleNamespace(account_inactive_orders="history"), close=AsyncMock()
+        )
+        self.venue.auth_token = lambda: "FAKE_TOKEN"
+        self.venue.fetch_orders = AsyncMock(return_value=[])
+        self.account = AsyncMock(return_value={
+            "code": 200, "accounts": [{"index": 123, "positions": []}],
+        })
+        self.history = AsyncMock(return_value={"code": 200, "orders": []})
+
+        async def read(method, **kwargs):
+            return await (self.account if method == "account" else self.history)(**kwargs)
+
+        self.venue.read = read
+
+    async def test_concurrent_reconciles_share_reads_and_include_late_ids(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def history(**kwargs):
+            if self.history.await_count == 1:
+                started.set()
+                await release.wait()
+                return {"code": 200, "orders": [raw_order("1", "filled", remaining="0")]}
+            return {"code": 200, "orders": [raw_order("2", "filled", remaining="0")]}
+
+        self.history.side_effect = history
+        self.venue._strategy_order_ids.update({"1", "2"})
+        first = asyncio.create_task(self.venue.reconcile(["1"]))
+        await started.wait()
+        second = asyncio.create_task(self.venue.reconcile(["2"], force_history=True))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(self.account.await_count, 1)
+        self.assertEqual(self.venue.fetch_orders.await_count, 1)
+        self.assertEqual(self.history.await_count, 2)
+        self.assertEqual(self.venue.filled_count, 2)
+
+    async def test_cancelled_waiter_does_not_cancel_shared_work(self):
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def account(**kwargs):
+            started.set()
+            await release.wait()
+            return {"code": 200, "accounts": [{"index": 123, "positions": []}]}
+
+        self.account.side_effect = account
+        first = asyncio.create_task(self.venue.reconcile())
+        await started.wait()
+        second = asyncio.create_task(self.venue.reconcile())
+        await asyncio.sleep(0)
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        self.assertFalse(self.venue._reconcile_task.cancelled())
+        release.set()
+        await second
+        self.assertEqual(self.account.await_count, 1)
+        self.assertEqual(self.venue.fetch_orders.await_count, 1)
+
+    async def test_unknown_history_cooldown_force_and_reconnect(self):
+        self.venue.update_order(raw_order("1"))
+        now = [100]
+        with patch("lighter_exchange.time", SimpleNamespace(monotonic=lambda: now[0])):
+            await self.venue.reconcile(["1"])
+            self.assertEqual(self.venue.orders["1"]["status"], "open")
+            self.assertEqual(self.venue._history_next["1"], 220)
+            now[0] = 160
+            await self.venue.reconcile(["1"])
+            self.assertEqual(self.history.await_count, 1)
+            await self.venue.reconcile(["1"], force_history=True)
+            self.assertEqual(self.history.await_count, 2)
+            now[0] = 281
+            await self.venue.reconcile(["1"])
+            self.assertEqual(self.history.await_count, 3)
+            self.venue.generation += 1
+            await self.venue.reconcile(["1"])
+            self.assertEqual(self.history.await_count, 4)
+        self.assertEqual(self.venue.filled_count, 0)
+        self.venue.update_order(raw_order("1", "filled", remaining="0"))
+        self.assertNotIn("1", self.venue._history_next)
+        await self.venue.reconcile(["1"])
+        self.assertEqual(self.history.await_count, 4)
+
+    async def test_force_joining_deferred_history_is_not_skipped(self):
+        self.venue._history_generation = self.venue.generation
+        self.venue._history_next["1"] = time.monotonic() + 120
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def history(**kwargs):
+            if self.history.await_count == 1:
+                started.set()
+                await release.wait()
+                return {"code": 200, "orders": []}
+            return {"code": 200, "orders": [raw_order("1", "filled", remaining="0")]}
+
+        self.history.side_effect = history
+        first = asyncio.create_task(self.venue.reconcile(["1", "2"]))
+        await started.wait()
+        second = asyncio.create_task(self.venue.reconcile(["1"], force_history=True))
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(self.venue.orders["1"]["status"], "filled")
+        self.assertEqual(self.account.await_count, 1)
+        self.assertEqual(self.venue.fetch_orders.await_count, 1)
+
+    async def test_reconnect_during_read_cannot_validate_stale_generation(self):
+        async def account(**kwargs):
+            self.venue.generation += 1
+            self.venue.positions = {"42": {"position": "2"}}
+            return {"code": 200, "accounts": [{"index": 123, "positions": []}]}
+
+        self.account.side_effect = account
+        await self.venue.reconcile()
+        self.assertFalse(self.venue.ready)
+        self.assertIn("42", self.venue.positions)
+
+    async def test_close_cancels_shared_work_and_rejects_new_reads(self):
+        started = asyncio.Event()
+
+        async def account(**kwargs):
+            started.set()
+            await asyncio.Event().wait()
+
+        self.account.side_effect = account
+        waiter = asyncio.create_task(self.venue.reconcile())
+        await started.wait()
+        await self.venue.close()
+        await asyncio.gather(waiter, return_exceptions=True)
+        self.assertTrue(self.venue._reconcile_task.cancelled())
+        self.venue.client.close.assert_awaited_once()
+        with self.assertRaises(ExchangeError):
+            await self.venue.reconcile()
+
+
 class LifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_run_builds_chunks_then_cancels_current_market_on_stop(self):
         venue = exchange()
-        trader = GridTrader(venue, {**CONFIG, "BATCH_SIZE": "2"})
+        trader = GridTrader(venue, {**CONFIG, "patch": "2"})
         trader._next_sync = time.monotonic() + 30
         chunks = []
 
@@ -709,6 +959,20 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, 0)
         self.assertEqual([len(chunk) for chunk in chunks], [2, 2, 2])
         self.assertEqual(venue.cancel_all_orders.await_count, 2)
+
+    async def test_exit_reports_fills_even_without_display_tick(self):
+        venue = exchange()
+        trader = GridTrader(venue, CONFIG)
+        trader.stop_event.set()
+
+        async def cancel():
+            venue._strategy_order_ids.add("1")
+            venue.update_order(raw_order("1", "filled", remaining="0"))
+
+        venue.cancel_all_orders = cancel
+        with patch("Light_grid.logger") as log:
+            self.assertEqual(await trader.run(), 0)
+        log.info.assert_called_with("本次完整成交 %s 笔", 1)
 
     async def test_disconnect_timeout_cancels_and_exits(self):
         venue = exchange()

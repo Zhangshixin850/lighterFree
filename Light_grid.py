@@ -56,7 +56,12 @@ class GridTrader:
         self.check_interval = float(config.get("CHECK_INTERVAL", "0.8"))
         self.reconcile_interval = float(config.get("REST_INTERVAL", "30"))
         self.disconnect_timeout = float(config.get("DISCONNECT_TIMEOUT", "30"))
-        self.batch_size = int(config.get("BATCH_SIZE", str(BATCH_SIZE)))
+        try:
+            self.batch_size = int(
+                config.get("patch", config.get("BATCH_SIZE", str(BATCH_SIZE)))
+            )
+        except (TypeError, ValueError):
+            raise ValueError(f"patch 必须是 1–{BATCH_SIZE} 之间的整数") from None
         self.cancel_on_exit = config.get("CANCEL_ON_EXIT", "true").lower() == "true"
         self.cancel_on_risk = config.get("CANCEL_ON_RISK", "true").lower() == "true"
         self.critical_error_limit = int(config.get("CRITICAL_ERROR_LIMIT", "3"))
@@ -103,7 +108,7 @@ class GridTrader:
                 "必须在 10–120 秒之间",
             ),
             (
-                "BATCH_SIZE",
+                "patch",
                 self.batch_size,
                 1 <= self.batch_size <= BATCH_SIZE,
                 f"必须在 1–{BATCH_SIZE} 之间",
@@ -120,6 +125,7 @@ class GridTrader:
         )
         if errors:
             raise ValueError("参数校验失败：" + "；".join(errors))
+        self.exchange.batch_size = self.batch_size
         # 核对间隔与过期阈值配套，保留一轮读取或重试的时间。
         self.exchange.reconcile_timeout = max(60, 2 * self.reconcile_interval)
         self.All_orders = {}
@@ -307,7 +313,10 @@ class GridTrader:
             metrics = self.exchange.metrics()
         except (KeyError, ValueError, FatalError):
             logger.info(
-                "%s | %s | 等待完整账户与行情数据", self.exchange.symbol, self.phase
+                "%s | %s | 成交 %s 笔 | 等待完整账户与行情数据",
+                self.exchange.symbol,
+                self.phase,
+                self.exchange.filled_count,
             )
             return
         active = [o for o in self.exchange.orders.values() if o["status"] == "open"]
@@ -319,13 +328,14 @@ class GridTrader:
         self.exchange.budget.delay()  # 清理窗口，便于展示真实用量。
         requests = sum(item[1] for item in self.exchange.budget.requests)
         logger.info(
-            "%s | %s | 价 %s | 仓 %s / 目标 %.5f | 浮盈 %.2f | 买/卖 %s/%s | MMR %.1f%% | 杠杆 %.2fx | API %s/%s",
+            "%s | %s | 价 %s | 仓 %s / 目标 %.5f | 浮盈 %.2f | 成交 %s 笔 | 买/卖 %s/%s | MMR %.1f%% | 杠杆 %.2fx | API %s/%s",
             self.exchange.symbol,
             self.phase,
             self.exchange.price,
             metrics["size"],
             target,
             metrics["pnl"],
+            self.exchange.filled_count,
             buys,
             len(active) - buys,
             metrics["mmr"] * 100,
@@ -452,6 +462,7 @@ class GridTrader:
                         "撤单未确认（%s）| 请检查交易所挂单", type(exc).__name__
                     )
                     risk_exit = True
+            logger.info("本次完整成交 %s 笔", self.exchange.filled_count)
         return 1 if risk_exit else 0
 
 
@@ -484,7 +495,7 @@ async def main(check_config=False):
         load_dotenv(directory / ".env", encoding="utf-8-sig")
         config = dict(os.environ)
         # Windows 环境变量枚举会大写键名，按原配置名读取以保留 gridStep 等名称。
-        for key in (*REQUIRED_CONFIG, "leverage"):
+        for key in (*REQUIRED_CONFIG, "leverage", "patch"):
             value = os.getenv(key)
             if value is not None:
                 config[key] = value
@@ -521,7 +532,7 @@ async def main(check_config=False):
         stage = "初始化 SDK / 加载市场"
         await exchange.initialize(config["SYMBOL"])
         logger.info(
-            "Lighter RH v1.0 | %s | %s | 批量+WebSocket",
+            "Lighter RH v2.0 | %s | %s | 批量+WebSocket",
             exchange.network,
             exchange.symbol,
         )

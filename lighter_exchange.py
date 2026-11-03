@@ -146,6 +146,9 @@ class LighterExchange:
         self.symbol = ""
         self.orders = {}
         self.order_versions = {}
+        self.filled_count = 0
+        self._strategy_order_ids = set()
+        self.batch_size = BATCH_SIZE
         self.positions = {}
         self.assets = {}
         self.stats = {}
@@ -171,6 +174,11 @@ class LighterExchange:
         self._client_index = 0
         self._sender = asyncio.Lock()
         self._ws_task = None
+        self._reconcile_task = None
+        self._reconcile_tracked = set()
+        self._reconcile_forced = set()
+        self._history_next = {}
+        self._history_generation = -1
         self._closing = False
         self._auth_until = 0.0
         self._auth = ""
@@ -347,6 +355,11 @@ class LighterExchange:
             "order_index": raw.get("order_index"),
         }
         self.order_versions[order_id] = self.sequence
+        self._history_next.pop(order_id, None)
+        if status == "filled" or status.startswith("canceled"):
+            if status == "filled" and order_id in self._strategy_order_ids:
+                self.filled_count += 1
+            self._strategy_order_ids.discard(order_id)
 
     async def fetch_orders(self, urgent=False):
         token = urgent_request.set(urgent)
@@ -377,8 +390,30 @@ class LighterExchange:
         finally:
             urgent_request.reset(token)
 
-    async def reconcile(self, tracked=()):
+    async def reconcile(self, tracked=(), *, force_history=False):
+        if self._closing:
+            raise ExchangeError("适配器正在关闭")
+        if self._reconcile_task is None or self._reconcile_task.done():
+            self._reconcile_tracked = set()
+            self._reconcile_forced = set()
+            self._reconcile_task = asyncio.create_task(
+                self._reconcile(self._reconcile_tracked, self._reconcile_forced),
+                name="lighter-reconcile",
+            )
+            # 等待者取消后，共用任务仍运行；取出无人接收的异常，避免遗留任务警告。
+            self._reconcile_task.add_done_callback(
+                lambda task: task.exception() if not task.cancelled() else None
+            )
+        self._reconcile_tracked.update(tracked)
+        if force_history:
+            self._reconcile_forced.update(tracked)
+        await asyncio.shield(self._reconcile_task)
+
+    async def _reconcile(self, tracked, forced):
         generation, version = self.generation, self.position_version
+        if self._history_generation != generation:
+            self._history_next.clear()
+            self._history_generation = generation
         result = await self.read(
             self.account_api.account,
             by="index",
@@ -395,47 +430,15 @@ class LighterExchange:
             raise FatalError("账户快照缺失")
         if account.get("bo_positions"):
             raise FatalError("当前账户存在二元期权持仓，永续风控口径不适用")
-        if version == self.position_version:
+        if generation == self.generation and version == self.position_version:
             self.positions = {str(p["market_id"]): p for p in account["positions"]}
-        start = self.sequence
         active = await self.fetch_orders()
-        active_ids = set()
-        for order in active:
-            oid = str(order.get("client_order_index") or order["order_index"])
-            active_ids.add(oid)
-            if self.order_versions.get(oid, 0) <= start:
-                self.update_order(order)
-        missing = set(tracked) - active_ids
-        missing = {
-            oid
-            for oid in missing
-            if self.orders.get(oid, {}).get("status") not in {"filled"}
-            and not self.orders.get(oid, {}).get("status", "").startswith("canceled")
+        active_ids = {
+            str(order.get("client_order_index") or order["order_index"])
+            for order in active
         }
-        cursor, cursors = None, set()
-        while missing:
-            kwargs = {"cursor": cursor} if cursor else {}
-            page = await self.read(
-                self.client.order_api.account_inactive_orders,
-                account_index=self.account_index,
-                market_id=int(self.market["market_id"]),
-                market_type="perp",
-                authorization=self.auth_token(),
-                limit=100,
-                **kwargs,
-            )
-            for order in page["orders"]:
-                oid = str(order.get("client_order_index") or order["order_index"])
-                if oid in missing:
-                    self.update_order(order)
-                    missing.discard(oid)
-            cursor = page.get("next_cursor")
-            if not cursor:
-                break
-            if cursor in cursors:
-                raise FatalError("历史订单返回重复分页游标")
-            cursors.add(cursor)
-        # REST 中消失但未查到终态的订单保留原记录，不推断成交。
+        for oid in active_ids:
+            self._history_next.pop(oid, None)
         if generation == self.generation and self.connected:
             if not self.bids or not self.asks:
                 ticker = await self.read(
@@ -450,6 +453,55 @@ class LighterExchange:
                     raise ExchangeError("盘口和备用行情均不可用")
                 self.price = self.price_to_precision(price)
                 self.last_price_at = time.monotonic()
+
+        checked, force_checked = set(), set()
+        while True:
+            # 等待 REST 期间后来加入的订单仅补查历史，共用本轮账户和挂单读取。
+            candidates = (tracked - checked) | (forced - force_checked)
+            if not candidates:
+                break
+            checked.update(candidates)
+            force_checked.update(candidates & forced)
+            missing = {
+                oid for oid in candidates - active_ids
+                if self.orders.get(oid, {}).get("status") != "filled"
+                and not self.orders.get(oid, {}).get("status", "").startswith("canceled")
+                and (oid in forced or time.monotonic() >= self._history_next.get(oid, 0))
+            }
+            cursor, cursors = None, set()
+            while missing:
+                kwargs = {"cursor": cursor} if cursor else {}
+                page = await self.read(
+                    self.client.order_api.account_inactive_orders,
+                    account_index=self.account_index,
+                    market_id=int(self.market["market_id"]),
+                    market_type="perp",
+                    authorization=self.auth_token(),
+                    limit=100,
+                    **kwargs,
+                )
+                for order in page["orders"]:
+                    oid = str(order.get("client_order_index") or order["order_index"])
+                    if oid in missing:
+                        self.update_order(order)
+                        missing.discard(oid)
+                missing = {
+                    oid for oid in missing
+                    if self.orders.get(oid, {}).get("status") != "filled"
+                    and not self.orders.get(oid, {}).get("status", "").startswith("canceled")
+                }
+                cursor = page.get("next_cursor")
+                if not cursor:
+                    break
+                if cursor in cursors:
+                    raise FatalError("历史订单返回重复分页游标")
+                cursors.add(cursor)
+            # 消失但未查到终态的订单不推断成交；提交确认可绕过周期重查间隔。
+            if generation == self.generation:
+                for oid in missing:
+                    self._history_next[oid] = time.monotonic() + 120
+
+        if generation == self.generation and self.connected:
             self.reconciled_generation = generation
             self.last_reconcile = time.monotonic()
 
@@ -634,12 +686,19 @@ class LighterExchange:
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
+    def _orders_confirmed(self, orders):
+        return bool(orders) and all(
+            (status := self.orders.get(order["id"], {}).get("status", ""))
+            in {"open", "filled"} or status.startswith("canceled")
+            for order in orders
+        )
+
     async def _submit(
         self, orders=None, cancel_ids=None, cancel_market=False, urgent=False
     ):
         orders, cancel_ids = orders or [], cancel_ids or []
-        if not 1 <= len(orders) + len(cancel_ids) + int(cancel_market) <= BATCH_SIZE:
-            raise ValueError(f"批量交易数量必须为 1–{BATCH_SIZE}")
+        if not 1 <= len(orders) + len(cancel_ids) + int(cancel_market) <= self.batch_size:
+            raise ValueError(f"批量交易数量必须为 1–{self.batch_size}（patch）")
         async with self._sender:
             if not urgent and not self.trading_enabled:
                 raise ExchangeError("连接或风控状态不允许新交易")
@@ -695,6 +754,7 @@ class LighterExchange:
                 )
             if any(item[3] for item in signed):
                 raise FatalError("批量签名失败，本批未发送")
+            self._strategy_order_ids.update(order["id"] for order in orders)
             self.pending_transactions = [
                 {"hash": item[2], "nonce": self._nonce + i, "type": item[0]}
                 for i, item in enumerate(signed)
@@ -729,25 +789,20 @@ class LighterExchange:
                 for attempt in range(5):
                     if self.error and not urgent:
                         raise self.error
-                    if orders:
-                        confirmed = all(
-                            self.orders.get(o["id"], {}).get("status")
-                            in {"open", "filled"}
-                            or self.orders.get(o["id"], {})
-                            .get("status", "")
-                            .startswith("canceled")
-                            for o in orders
-                        )
-                    else:
-                        confirmed = False
-                    if confirmed:
+                    if self._orders_confirmed(orders):
                         return
                     if attempt == 4:
                         break
                     await asyncio.sleep(1 if attempt == 0 else 2)
+                    if self.error and not urgent:
+                        raise self.error
+                    if self._orders_confirmed(orders):
+                        return  # 推送已在等待期间确认，无需再查 REST。
                     try:
                         if orders:
-                            await self.reconcile([o["id"] for o in orders])
+                            await self.reconcile(
+                                [o["id"] for o in orders], force_history=True
+                            )
                         else:
                             active = await self.fetch_orders(urgent=urgent)
                             active_ids = {
@@ -772,9 +827,9 @@ class LighterExchange:
     async def cancel_orders(self, ids):
         token = urgent_request.set(True)
         try:
-            for index in range(0, len(ids), BATCH_SIZE):
+            for index in range(0, len(ids), self.batch_size):
                 await self._submit(
-                    cancel_ids=ids[index : index + BATCH_SIZE], urgent=True
+                    cancel_ids=ids[index : index + self.batch_size], urgent=True
                 )
         finally:
             urgent_request.reset(token)
@@ -788,8 +843,9 @@ class LighterExchange:
 
     async def close(self):
         self._closing = True
-        if self._ws_task:
-            self._ws_task.cancel()
-            await asyncio.gather(self._ws_task, return_exceptions=True)
+        tasks = [task for task in (self._ws_task, self._reconcile_task) if task]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self.client:
             await self.client.close()
