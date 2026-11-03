@@ -330,12 +330,13 @@ class GridTrader:
         self.exchange.budget.delay()  # 清理窗口，便于展示真实用量。
         requests = sum(item[1] for item in self.exchange.budget.requests)
         logger.info(
-            "%s | %s | 价 %s | 仓 %s / 目标 %.5f | 浮盈 %.2f | 成交 %s 笔 | 买/卖 %s/%s | MMR %.1f%% | 杠杆 %.2fx | API %s/%s",
+            "%s | %s | 价 %s | 仓 %s / 目标 %.5f | 目标差额 %+.5f（负值买、正值卖） | 浮盈 %.2f | 成交 %s 笔 | 买/卖 %s/%s | MMR %.1f%% | 杠杆 %.2fx | API %s/%s",
             self.exchange.symbol,
             self.phase,
             self.exchange.price,
             metrics["size"],
             target,
+            metrics["size"] - target,
             metrics["pnl"],
             self.exchange.filled_count,
             buys,
