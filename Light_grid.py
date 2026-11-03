@@ -17,10 +17,11 @@ from lighter_exchange import (
     API_BATCH_LIMIT,
     BATCH_SIZE,
     REQUEST_LIMIT,
-    TX_TYPE_LIMIT,
     ExchangeError,
     FatalError,
     LighterExchange,
+    NotSubmittedError,
+    RateLimitError,
     number,
 )
 
@@ -271,11 +272,24 @@ class GridTrader:
         )
 
     def finish_operation(self):
-        self.operation.result()
+        try:
+            accepted = self.operation.result()
+        except (RateLimitError, NotSubmittedError) as exc:
+            self.operation = None
+            self.queue.extendleft(reversed(self.batch))
+            self.batch = []
+            self.phase = "限速冷却" if isinstance(exc, RateLimitError) else "同步"
+            logger.warning("%s | %s | 保留原任务，稍后继续", self.phase, exc)
+            return
         self.operation = None
         if self.operation_kind == "cancel":
             # 确认撤单后清除旧网格归属，主动撤单不进入自动重挂。
             self.build_grid()
+            return
+        if accepted is False:
+            self.operation = self.exchange.verification_task
+            self.operation_kind = "verify"
+            self.phase = "后台核对"
             return
         filled = canceled = 0
         for item in self.batch:
@@ -292,7 +306,7 @@ class GridTrader:
                     self.counter += 1
                     filled += 1
         logger.info(
-            "批量确认 | %s 笔 | 成交补单 %s | 撤单重挂 %s",
+            "批量登记 | %s 笔 | 成交补单 %s | 撤单重挂 %s",
             len(self.batch),
             filled,
             canceled,
@@ -364,6 +378,9 @@ class GridTrader:
                         self._next_sync = now + self.reconcile_interval
                     except FatalError:
                         raise
+                    except RateLimitError as exc:
+                        self._next_sync = max(now + 2, self.exchange.budget.cooldown)
+                        logger.warning("账户核对限速 | %s | 冷却后继续", exc)
                     except Exception as exc:
                         self.critical_errors += 1
                         self._next_sync = now + self._sync_retry
@@ -397,7 +414,9 @@ class GridTrader:
                     if not self.switc:
                         self.replacements()
                     if not self.operation:
-                        if self.switc:
+                        if now < self.exchange.budget.cooldown:
+                            self.phase = "限速冷却"
+                        elif self.switc:
                             self.phase = "撤单"
                             self.operation_kind = "cancel"
                             self.operation = asyncio.create_task(
@@ -405,23 +424,28 @@ class GridTrader:
                             )
                         elif self.queue:
                             available = self.exchange.budget.available(14)
-                            count = min(
-                                self.batch_size,
-                                API_BATCH_LIMIT,
-                                len(self.queue),
-                                available or TX_TYPE_LIMIT,
-                            )
-                            self.batch = [self.queue.popleft() for _ in range(count)]
-                            self.operation_kind = "create"
-                            self.operation = asyncio.create_task(
-                                self.exchange.create_orders(
-                                    [i["order"] for i in self.batch]
+                            if available:
+                                count = min(
+                                    self.batch_size, API_BATCH_LIMIT, len(self.queue), available
                                 )
-                            )
+                                self.batch = [self.queue.popleft() for _ in range(count)]
+                                self.operation_kind = "create"
+                                self.operation = asyncio.create_task(
+                                    self.exchange.create_orders(
+                                        [i["order"] for i in self.batch]
+                                    )
+                                )
+                            else:
+                                self.phase = "等待额度"
                 else:
                     self.phase = "同步"
                     if self.exchange.reconciled_generation != self.exchange.generation:
                         self._next_sync = min(self._next_sync, now + 1)
+                    # 已知限速可能阻止重连和 REST 同步，冷却结束后再计算恢复时限。
+                    if now < self.exchange.budget.cooldown:
+                        self._unhealthy_since = max(
+                            self._unhealthy_since, self.exchange.budget.cooldown
+                        )
                     if now - self._unhealthy_since >= self.disconnect_timeout:
                         raise FatalError("连接或数据同步超过等待上限")
                 self.display()

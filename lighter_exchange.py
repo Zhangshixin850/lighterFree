@@ -32,6 +32,10 @@ class RateLimitError(ExchangeError):
     pass
 
 
+class NotSubmittedError(ExchangeError):
+    """请求尚未发送，原任务可保留后重试。"""
+
+
 def number(value):
     result = Decimal(str(value))
     if not result.is_finite():
@@ -176,6 +180,7 @@ class LighterExchange:
         self._sender = asyncio.Lock()
         self._ws_task = None
         self._reconcile_task = None
+        self.verification_task = None
         self._reconcile_tracked = set()
         self._reconcile_forced = set()
         self._history_next = {}
@@ -239,7 +244,7 @@ class LighterExchange:
             await self.budget.acquire(types, urgent)
             if types and not urgent:
                 if not self.trading_enabled or not self.ready:
-                    raise ExchangeError("交易已暂停，本批未提交")
+                    raise NotSubmittedError("交易已暂停，本批未提交")
                 if self.before_send:
                     reason = self.before_send()
                     if reason:
@@ -253,8 +258,13 @@ class LighterExchange:
                 except (TypeError, ValueError):
                     delay = 60
                 self.budget.penalize(delay)
-                await response.read()
-                raise RateLimitError("API 限速，进入冷却")
+                try:
+                    await response.read()
+                except Exception:
+                    pass  # 已收到明确限速状态，正文读取失败不改变拒绝分类。
+                raise RateLimitError(f"HTTP {response.status} 限速，进入冷却")
+            if types and 400 <= response.status < 500:
+                raise FatalError(f"批量提交被拒绝，HTTP {response.status}")
             return response
 
         rest.request = limited_request
@@ -357,6 +367,10 @@ class LighterExchange:
         }
         self.order_versions[order_id] = self.sequence
         self._history_next.pop(order_id, None)
+        if status in {"open", "filled"} or status.startswith("canceled"):
+            self.pending_transactions = [
+                tx for tx in self.pending_transactions if tx.get("order_id") != order_id
+            ]
         if status == "filled" or status.startswith("canceled"):
             if status == "filled" and order_id in self._strategy_order_ids:
                 self.filled_count += 1
@@ -379,9 +393,11 @@ class LighterExchange:
                 active_ids.add(oid)
                 if self.order_versions.get(oid, 0) <= start:
                     self.update_order(raw)
+            awaiting = {tx.get("order_id") for tx in self.pending_transactions}
             for oid, order in list(self.orders.items()):
                 if (
                     oid not in active_ids
+                    and oid not in awaiting
                     and self.order_versions.get(oid, 0) <= start
                     and order["status"] in {"open", "pending", "in-progress"}
                 ):
@@ -694,6 +710,49 @@ class LighterExchange:
             for order in orders
         )
 
+    def _register_pending(self, orders):
+        for order in orders:
+            if order["id"] not in self.orders:
+                self.sequence += 1
+                self.orders[order["id"]] = {
+                    **order,
+                    "status": "pending",
+                    "remaining": order["amount"],
+                    "filled": Decimal(0),
+                    "order_index": None,
+                }
+                self.order_versions[order["id"]] = self.sequence
+
+    async def _verify_orders(self, orders):
+        try:
+            lookups = 0
+            while True:
+                if self.error:
+                    raise self.error
+                if self._orders_confirmed(orders):
+                    logger.info("后台核对完成 | %s 笔", len(orders))
+                    return
+                if lookups == 4:
+                    break
+                await asyncio.sleep(1 if lookups == 0 else 2)
+                if self._orders_confirmed(orders):
+                    continue
+                try:
+                    await self.reconcile([o["id"] for o in orders], force_history=True)
+                except RateLimitError:
+                    # 已知冷却不消耗结果核对机会；仍不重发原交易。
+                    await asyncio.sleep(max(0.5, self.budget.cooldown - time.monotonic()))
+                    continue
+                except FatalError:
+                    raise
+                except ExchangeError:
+                    pass
+                lookups += 1
+            raise FatalError("提交结果仍不明，停止以避免重复下单")
+        except Exception as exc:
+            self.error = exc if isinstance(exc, FatalError) else FatalError("后台订单核对失败")
+            raise self.error
+
     async def _submit(
         self, orders=None, cancel_ids=None, cancel_market=False, urgent=False
     ):
@@ -703,8 +762,12 @@ class LighterExchange:
         if len(orders) + len(cancel_ids) + int(cancel_market) > API_BATCH_LIMIT:
             raise ValueError(f"单次批量超过平台容量 {API_BATCH_LIMIT}")
         async with self._sender:
+            if not urgent and self.error:
+                raise self.error
+            if not urgent and self.verification_task and not self.verification_task.done():
+                raise NotSubmittedError("上一批提交结果待后台核对")
             if not urgent and not self.trading_enabled:
-                raise ExchangeError("连接或风控状态不允许新交易")
+                raise NotSubmittedError("连接或风控状态不允许新交易")
             if self._nonce is None or self._nonce_generation != self.generation:
                 result = await self.read(
                     self.client.tx_api.next_nonce,
@@ -758,74 +821,117 @@ class LighterExchange:
             if any(item[3] for item in signed):
                 raise FatalError("批量签名失败，本批未发送")
             self._strategy_order_ids.update(order["id"] for order in orders)
-            self.pending_transactions = [
-                {"hash": item[2], "nonce": self._nonce + i, "type": item[0]}
+            start_nonce = self._nonce
+            transactions = [
+                {
+                    "hash": item[2],
+                    "nonce": self._nonce + i,
+                    "type": item[0],
+                    "order_id": orders[i]["id"] if i < len(orders) else None,
+                }
                 for i, item in enumerate(signed)
             ]
+            self.pending_transactions.extend(transactions)
             self._nonce += len(signed)
             logger.debug(
                 "提交批量：orders=%s tx=%s",
                 [o["id"] for o in orders],
-                self.pending_transactions,
+                transactions,
             )
             count_token = transaction_types.set(tuple(s[0] for s in signed))
             urgent_token = urgent_request.set(urgent)
+            uncertain = False
             try:
                 response = await self.client.send_tx_batch(
                     [s[0] for s in signed], [s[1] for s in signed]
                 )
                 if response.code == 23000:
                     self.budget.penalize()
+                    raise RateLimitError("code=23000 限速，进入冷却")
                 if response.code != 200:
-                    self._nonce = None
                     raise FatalError(f"批量提交被拒绝，code={response.code}")
-            except FatalError:
-                self.pending_transactions = []
+            except (RateLimitError, NotSubmittedError, FatalError) as exc:
+                if isinstance(exc, RateLimitError) and self.budget.cooldown <= time.monotonic():
+                    self.budget.penalize()
+                # 明确未提交时回收本批 nonce，保留此前已接收批次的 nonce 下界。
+                if isinstance(exc, RateLimitError) and any(
+                    o["id"] in self.orders for o in orders
+                ):
+                    uncertain = True  # 若推送已有本批订单，不能按整批拒绝重发。
+                    logger.warning("限速回执与本批订单推送不一致 | 转后台核对，不重发")
+                else:
+                    self._nonce = start_nonce
+                    self._nonce_generation = -1
+                    hashes = {tx["hash"] for tx in transactions}
+                    self.pending_transactions = [
+                        tx for tx in self.pending_transactions if tx["hash"] not in hashes
+                    ]
+                    self._strategy_order_ids.difference_update(o["id"] for o in orders)
+                    raise
+            except asyncio.CancelledError:
+                # 已进入传输阶段，取消并不能证明服务器未接收。
+                if orders:
+                    self._register_pending(orders)
                 raise
             except Exception as exc:
-                # 传输异常也可能已经提交；只确认，不自动重发。
-                logger.warning("批量回执待确认（%s）", type(exc).__name__)
+                uncertain = True
+                logger.warning(
+                    "提交结果不明（%s）| %s 笔 | 转后台核对，不重发",
+                    type(exc).__name__, len(signed),
+                )
             finally:
                 transaction_types.reset(count_token)
                 urgent_request.reset(urgent_token)
+            if orders:
+                self._register_pending(orders)
+                if uncertain:
+                    self.verification_task = asyncio.create_task(
+                        self._verify_orders(orders), name="lighter-verify-orders"
+                    )
+                    self.verification_task.add_done_callback(
+                        lambda task: task.exception() if not task.cancelled() else None
+                    )
+                    return False
+                return True  # 已接收即返回；订单状态随后由 WebSocket 更新。
             try:
                 for attempt in range(5):
                     if self.error and not urgent:
                         raise self.error
-                    if self._orders_confirmed(orders):
-                        return
                     if attempt == 4:
                         break
                     await asyncio.sleep(1 if attempt == 0 else 2)
                     if self.error and not urgent:
                         raise self.error
-                    if self._orders_confirmed(orders):
-                        return  # 推送已在等待期间确认，无需再查 REST。
                     try:
-                        if orders:
-                            await self.reconcile(
-                                [o["id"] for o in orders], force_history=True
-                            )
-                        else:
-                            active = await self.fetch_orders(urgent=urgent)
-                            active_ids = {
-                                str(o.get("client_order_index") or o["order_index"])
-                                for o in active
-                            }
-                            if (cancel_market and not active) or (
-                                not cancel_market and not set(cancel_ids) & active_ids
-                            ):
-                                return
+                        active = await self.fetch_orders(urgent=urgent)
+                        active_ids = {
+                            str(o.get("client_order_index") or o["order_index"])
+                            for o in active
+                        }
+                        if (cancel_market and not active) or (
+                            not cancel_market and not set(cancel_ids) & active_ids
+                        ):
+                            if cancel_market:
+                                for oid, order in list(self.orders.items()):
+                                    if order["status"] in {"open", "pending", "in-progress"}:
+                                        self.orders.pop(oid, None)
+                                self.pending_transactions = []
+                            return
+                    except RateLimitError:
+                        await asyncio.sleep(max(0.5, self.budget.cooldown - time.monotonic()))
                     except FatalError:
                         raise
                     except ExchangeError:
                         continue
                 raise FatalError("无法确认批量交易结果，停止以避免重复下单")
             finally:
-                self.pending_transactions = []
+                hashes = {tx["hash"] for tx in transactions}
+                self.pending_transactions = [
+                    tx for tx in self.pending_transactions if tx["hash"] not in hashes
+                ]
 
     async def create_orders(self, orders):
-        await self._submit(orders=orders)
+        return await self._submit(orders=orders)
 
     async def cancel_orders(self, ids):
         token = urgent_request.set(True)
@@ -841,13 +947,22 @@ class LighterExchange:
     async def cancel_all_orders(self):
         token = urgent_request.set(True)
         try:
-            await self._submit(cancel_market=True, urgent=True)
+            while True:
+                try:
+                    await self._submit(cancel_market=True, urgent=True)
+                    return
+                except RateLimitError as exc:
+                    logger.warning("撤单限速 | %s | 冷却后继续", exc)
+                    await asyncio.sleep(max(0.5, self.budget.cooldown - time.monotonic()))
         finally:
             urgent_request.reset(token)
 
     async def close(self):
         self._closing = True
-        tasks = [task for task in (self._ws_task, self._reconcile_task) if task]
+        tasks = [
+            task for task in (self._ws_task, self._reconcile_task, self.verification_task)
+            if task
+        ]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
