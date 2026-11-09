@@ -619,13 +619,19 @@ class LighterExchange:
             self.last_stats_at = time.monotonic()
         elif channel == "account_tx":
             for tx in message.get("txs", []):
-                if tx.get("hash") not in {t["hash"] for t in self.pending_transactions}:
+                pending = next(
+                    (t for t in self.pending_transactions if t["hash"] == tx.get("hash")),
+                    None,
+                )
+                if pending is None:
                     continue
                 event = tx.get("event_info") or "{}"
                 event = json.loads(event) if isinstance(event, str) else event
                 if event.get("ae"):
                     logger.debug("交易执行失败 hash=%s event=%s", tx["hash"], event)
-                    self.error = FatalError("批量中的交易执行被拒绝")
+                    if pending["type"] != 15:
+                        self.error = FatalError("批量中的交易执行被拒绝")
+                    # 单笔撤单可能与成交竞争；由在途撤单的 REST 核对判定是否已移除。
         if snapshot:
             self.snapshots.add(channel)
 
@@ -776,6 +782,11 @@ class LighterExchange:
                 )
                 self._nonce = max(self._nonce or 0, int(result["nonce"]))
                 self._nonce_generation = self.generation
+            unseen_cancels = {
+                oid for oid in cancel_ids
+                if self.orders.get(oid, {}).get("status") not in {"open", "filled"}
+                and not self.orders.get(oid, {}).get("status", "").startswith("canceled")
+            }
             signed = []
             for order in orders:
                 # SDK signer 使用 size_decimals / price_decimals，不是显示精度。
@@ -894,23 +905,40 @@ class LighterExchange:
                     return False
                 return True  # 已接收即返回；订单状态随后由 WebSocket 更新。
             try:
-                for attempt in range(5):
+                attempt = 0
+                while attempt < 4:
                     if self.error and not urgent:
                         raise self.error
-                    if attempt == 4:
-                        break
                     await asyncio.sleep(1 if attempt == 0 else 2)
                     if self.error and not urgent:
                         raise self.error
                     try:
+                        start = self.sequence
                         active = await self.fetch_orders(urgent=urgent)
                         active_ids = {
                             str(o.get("client_order_index") or o["order_index"])
                             for o in active
                         }
+                        active_ids.update(
+                            oid for oid in cancel_ids
+                            if self.order_versions.get(oid, 0) > start
+                            and self.orders.get(oid, {}).get("status")
+                            in {"open", "pending", "in-progress"}
+                        )
                         if (cancel_market and not active) or (
                             not cancel_market and not set(cancel_ids) & active_ids
                         ):
+                            if unseen_cancels:
+                                # 新单尚未见于推送时，旧空快照不足以证明撤销成功。
+                                await self.reconcile(unseen_cancels, force_history=True)
+                                if not self._orders_confirmed(
+                                    [{"id": oid} for oid in unseen_cancels]
+                                ) or any(
+                                    self.orders[oid]["status"] == "open"
+                                    for oid in unseen_cancels
+                                ):
+                                    attempt += 1
+                                    continue
                             if cancel_market:
                                 for oid, order in list(self.orders.items()):
                                     if order["status"] in {"open", "pending", "in-progress"}:
@@ -919,10 +947,12 @@ class LighterExchange:
                             return
                     except RateLimitError:
                         await asyncio.sleep(max(0.5, self.budget.cooldown - time.monotonic()))
+                        continue
                     except FatalError:
                         raise
                     except ExchangeError:
-                        continue
+                        pass
+                    attempt += 1
                 raise FatalError("无法确认批量交易结果，停止以避免重复下单")
             finally:
                 hashes = {tx["hash"] for tx in transactions}
@@ -938,9 +968,13 @@ class LighterExchange:
         try:
             count = min(self.batch_size, API_BATCH_LIMIT)
             for index in range(0, len(ids), count):
-                await self._submit(
-                    cancel_ids=ids[index : index + count], urgent=True
-                )
+                pending = [
+                    oid for oid in ids[index : index + count]
+                    if self.orders.get(oid, {}).get("status") != "filled"
+                    and not self.orders.get(oid, {}).get("status", "").startswith("canceled")
+                ]
+                if pending:
+                    await self._submit(cancel_ids=pending, urgent=True)
         finally:
             urgent_request.reset(token)
 

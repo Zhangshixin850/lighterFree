@@ -137,6 +137,9 @@ class GridTrader:
         self.switc = True
         self.counter = 0
         self.queue = deque()
+        self.shift = None
+        self.retiring = set()
+        self.cancel_batch = []
         self.operation = None
         self.operation_kind = ""
         self.batch = []
@@ -180,12 +183,21 @@ class GridTrader:
         return ""
 
     def replacements(self):
+        if self.operation:
+            return  # 在途批次先完成登记或核对，再计算平移差集。
+        canceling = set(self.shift["cancel_ids"]) if self.shift else set()
+        for oid in tuple(self.retiring - canceling):
+            status = self.exchange.orders.get(oid, {}).get("status", "")
+            if status == "filled" or status.startswith("canceled"):
+                # 被移出网格的订单仍核对终态、计数，但不恢复已移除的槽位。
+                self.All_orders.pop(oid, None)
+                self.retiring.discard(oid)
         last_price = self.last_fill_price or self.myNewPrice
         queued = {item["origin"] for item in self.queue if item["origin"]}
         queued.update(item["origin"] for item in self.batch if item["origin"])
         eligible = []
         for oid in self.All_orders:
-            if oid in queued:
+            if oid in queued or oid in self.retiring:
                 continue
             status = self.exchange.orders.get(oid, {}).get("status", "")
             if status == "filled" or status.startswith("canceled"):
@@ -203,14 +215,10 @@ class GridTrader:
             if self.All_orders[oid][0]
             and self.exchange.orders[oid]["status"] == "filled"
         ]
-        if edges:
-            self.last_fill_price = self.All_orders[edges[-1]][1]
-            self.myNewPrice = self.last_fill_price
-            self.switc = True
-            self.queue.clear()
-            logger.info("边界成交 | 重建中心 %s", self.myNewPrice)
-            return
+        center = self.All_orders[edges[-1]][1] if edges and not self.shift else None
         for oid in eligible:
+            if self.shift and oid in edges:
+                continue  # 平移中的新边缘留到下一轮，不能丢失或重复处理。
             edge, old_price, old_side = self.All_orders[oid]
             status = self.exchange.orders[oid]["status"]
             canceled = status.startswith("canceled")
@@ -238,6 +246,68 @@ class GridTrader:
                     order["amount"],
                     order["price"],
                 )
+        if center is not None:
+            self.shift_grid(center)
+
+    def shift_grid(self, center):
+        half = self.gridLines // 2
+        target = {}
+        for i in range(1, half + 1):
+            for side, price in (
+                ("buy", center - i * self.gridStep),
+                ("sell", center + i * self.gridStep),
+            ):
+                order = self.exchange.prepare_order(side, self.orderSize, price)
+                target[side, order["price"]] = (order, int(i == half))
+        if len({price for _, price in target}) != self.gridLines:
+            raise FatalError("精度转换后网格价格重叠")
+
+        covered, cancel_ids = set(), []
+        for oid, record in self.All_orders.items():
+            if oid in self.retiring:
+                continue
+            status = self.exchange.orders.get(oid, {}).get("status", "")
+            if status == "filled" or status.startswith("canceled"):
+                continue
+            key = record[2], record[1]
+            if key in target and key not in covered:
+                covered.add(key)
+                record[0] = target[key][1]
+            else:
+                cancel_ids.append(oid)
+
+        retained = len(covered)
+        # 已排队的成交反向单也占目标槽位；覆盖过的槽位不重复新建。
+        queue = deque()
+        for item in self.queue:
+            key = item["order"]["side"], item["order"]["price"]
+            if key in target and key not in covered:
+                item["edge"] = target[key][1]
+                covered.add(key)
+                queue.append(item)
+            elif item["origin"]:
+                self.All_orders.pop(item["origin"], None)
+        for key, (order, edge) in target.items():
+            if key not in covered:
+                queue.append(
+                    {
+                        "order": order,
+                        "origin": None,
+                        "edge": edge,
+                        "old_price": Decimal(0),
+                        "canceled": False,
+                    }
+                )
+        cancel_ids.sort(key=lambda oid: abs(self.All_orders[oid][1] - center), reverse=True)
+        self.retiring.update(cancel_ids)
+        self.shift = {"cancel_ids": deque(cancel_ids)}
+        self.queue = queue
+        self.last_fill_price = self.myNewPrice = center
+        self.phase = "平移撤单" if cancel_ids else "平移补单"
+        logger.info(
+            "边界成交 | 平移中心 %s | 保留 %s 笔 | 撤远侧 %s 笔 | 待补 %s 笔",
+            center, retained, len(cancel_ids), len(queue),
+        )
 
     def build_grid(self):
         self.All_orders.clear()
@@ -276,7 +346,9 @@ class GridTrader:
             accepted = self.operation.result()
         except (RateLimitError, NotSubmittedError) as exc:
             self.operation = None
-            self.queue.extendleft(reversed(self.batch))
+            if self.operation_kind != "shift_cancel":
+                self.queue.extendleft(reversed(self.batch))
+            self.cancel_batch = []
             self.batch = []
             self.phase = "限速冷却" if isinstance(exc, RateLimitError) else "同步"
             logger.warning("%s | %s | 保留原任务，稍后继续", self.phase, exc)
@@ -285,6 +357,12 @@ class GridTrader:
         if self.operation_kind == "cancel":
             # 确认撤单后清除旧网格归属，主动撤单不进入自动重挂。
             self.build_grid()
+            return
+        if self.operation_kind == "shift_cancel":
+            for _ in self.cancel_batch:
+                self.shift["cancel_ids"].popleft()
+            self.cancel_batch = []
+            self.phase = "平移补单"
             return
         if accepted is False:
             self.operation = self.exchange.verification_task
@@ -422,6 +500,14 @@ class GridTrader:
                             self.operation = asyncio.create_task(
                                 self.exchange.cancel_all_orders()
                             )
+                        elif self.shift and self.shift["cancel_ids"]:
+                            self.phase = "平移撤单"
+                            count = min(self.batch_size, API_BATCH_LIMIT)
+                            self.cancel_batch = list(self.shift["cancel_ids"])[:count]
+                            self.operation_kind = "shift_cancel"
+                            self.operation = asyncio.create_task(
+                                self.exchange.cancel_orders(self.cancel_batch)
+                            )
                         elif self.queue:
                             available = self.exchange.budget.available(14)
                             if available:
@@ -437,6 +523,10 @@ class GridTrader:
                                 )
                             else:
                                 self.phase = "等待额度"
+                        elif self.shift:
+                            self.shift = None
+                            self.phase = "运行"
+                            logger.info("半边平移完成 | 中心 %s", self.myNewPrice)
                 else:
                     self.phase = "同步"
                     if self.exchange.reconciled_generation != self.exchange.generation:
@@ -560,7 +650,7 @@ async def main(check_config=False):
         stage = "初始化 SDK / 加载市场"
         await exchange.initialize(config["SYMBOL"])
         logger.info(
-            "Lighter RH v2.0 | %s | %s | 批量+WebSocket",
+            "Lighter RH v5.0 | %s | %s | 批量+WebSocket",
             exchange.network,
             exchange.symbol,
         )

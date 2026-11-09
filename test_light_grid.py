@@ -337,7 +337,7 @@ class StrategyTests(unittest.TestCase):
         self.trader.replacements()
         self.assertEqual(len(self.trader.queue), 2)
 
-    def test_edge_wins_over_regular_fill(self):
+    def test_edge_shifts_and_keeps_regular_fill_replacements(self):
         self.trader.All_orders = {
             "1": [0, Decimal(59), "buy"],
             "2": [1, Decimal(57), "buy"],
@@ -346,9 +346,14 @@ class StrategyTests(unittest.TestCase):
         self.venue.update_order(raw_order("1", "filled", remaining="0"))
         self.venue.update_order(raw_order("2", "filled", "57", "0"))
         self.trader.replacements()
-        self.assertTrue(self.trader.switc)
+        self.assertFalse(self.trader.switc)
+        self.assertIsNotNone(self.trader.shift)
         self.assertEqual(self.trader.myNewPrice, Decimal(57))
-        self.assertFalse(self.trader.queue)
+        self.assertEqual(
+            {(item["order"]["side"], item["order"]["price"]) for item in self.trader.queue},
+            {("buy", Decimal(p)) for p in (54, 55, 56)}
+            | {("sell", Decimal(p)) for p in (58, 59, 60)},
+        )
         self.assertEqual(self.venue.filled_count, 2)
         self.assertEqual(self.trader.counter, 0)
 
@@ -1110,6 +1115,543 @@ class SubmissionRecoveryTests(unittest.IsolatedAsyncioTestCase):
             await started.wait()
             await venue.close()
         self.assertTrue(venue.verification_task.cancelled())
+
+
+class EdgeShiftTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.venue = exchange()
+        self.trader = GridTrader(self.venue, {**CONFIG, "patch": "2"})
+        self.seed_grid()
+        self.creates, self.cancels, self.phases = [], [], []
+        self.venue.create_orders = AsyncMock(side_effect=self.create)
+        self.venue.cancel_orders = AsyncMock(side_effect=self.cancel)
+        self.venue.cancel_all_orders = AsyncMock()
+
+    def seed_grid(self):
+        self.venue.orders.clear()
+        self.venue.order_versions.clear()
+        self.venue._strategy_order_ids.clear()
+        self.trader.build_grid()
+        for item in self.trader.queue:
+            order = item["order"]
+            self.trader.All_orders[order["id"]] = [
+                item["edge"], order["price"], order["side"],
+            ]
+            self.venue._strategy_order_ids.add(order["id"])
+            self.venue.update_order(raw_order(
+                order["id"], price=str(order["price"]), ask=order["side"] == "sell",
+            ))
+        self.trader.queue.clear()
+        self.trader._next_sync = float("inf")
+
+    def owned(self):
+        return {
+            (record[2], record[1]): oid
+            for oid, record in self.trader.All_orders.items()
+            if oid not in self.trader.retiring
+            and self.venue.orders.get(oid, {}).get("status") in {"open", "pending"}
+        }
+
+    def fill(self, side, price):
+        oid = self.owned()[side, Decimal(price)]
+        self.venue.update_order(raw_order(
+            oid, "filled", str(price), "0", ask=side == "sell",
+        ))
+        return oid
+
+    async def create(self, orders):
+        self.creates.append(list(orders))
+        for order in orders:
+            self.venue._strategy_order_ids.add(order["id"])
+            self.venue.update_order(raw_order(
+                order["id"], price=str(order["price"]), ask=order["side"] == "sell",
+            ))
+        return True
+
+    async def cancel(self, ids):
+        self.cancels.append(list(ids))
+        for oid in ids:
+            old = self.venue.orders[oid]
+            self.venue.update_order(raw_order(
+                oid, "canceled", str(old["price"]), str(old["remaining"]),
+                ask=old["side"] == "sell",
+            ))
+
+    async def normal_fills(self, side, prices):
+        for price in prices:
+            self.fill(side, price)
+            self.trader.replacements()
+            while self.trader.queue:
+                self.trader.batch = [self.trader.queue.popleft()]
+                self.trader.operation_kind = "create"
+                self.trader.operation = asyncio.create_task(self.venue.create_orders(
+                    [self.trader.batch[0]["order"]]
+                ))
+                await self.trader.operation
+                self.trader.finish_operation()
+        self.creates.clear()
+
+    async def run_to_idle(self):
+        self.trader.stop_event.clear()
+
+        def display():
+            self.phases.append(self.trader.phase)
+            active = sum(
+                order["status"] in {"open", "pending", "in-progress"}
+                for order in self.venue.orders.values()
+            )
+            self.assertLessEqual(active, self.trader.gridLines + 4)
+            pending_edge = any(
+                record[0] and oid not in self.trader.retiring
+                and self.venue.orders.get(oid, {}).get("status") == "filled"
+                for oid, record in self.trader.All_orders.items()
+            )
+            if (not self.trader.shift and not self.trader.queue
+                    and not self.trader.operation and not pending_edge):
+                self.trader.stop_event.set()
+
+        self.trader.display = display
+        result = await asyncio.wait_for(self.trader.run(), timeout=4)
+        self.assertEqual(result, 0)
+
+    async def test_buy_edge_preserves_partial_orders_and_moves_half(self):
+        await self.normal_fills("buy", (59, 58))
+        preserved = self.owned().copy()
+        oid = preserved["sell", Decimal(59)]
+        self.venue.update_order(raw_order(oid, price="59", remaining="0.4", ask=True))
+        removed = {preserved["sell", Decimal(p)] for p in (61, 62, 63)}
+        self.fill("buy", 57)
+        await self.run_to_idle()
+        final = self.owned()
+        self.assertEqual(set(final),
+            {("buy", Decimal(p)) for p in (54, 55, 56)}
+            | {("sell", Decimal(p)) for p in (58, 59, 60)})
+        for price in (59, 60):
+            self.assertEqual(final["sell", Decimal(price)], preserved["sell", Decimal(price)])
+        self.assertEqual(self.venue.orders[oid]["remaining"], Decimal("0.4"))
+        self.assertEqual({oid for batch in self.cancels for oid in batch}, removed)
+        self.assertEqual([len(batch) for batch in self.cancels], [2, 1])
+        self.assertEqual(sum(map(len, self.creates)), 4)
+        self.assertEqual(self.venue.filled_count, 3)
+        self.assertEqual(self.trader.myNewPrice, 57)
+        self.assertEqual(
+            {(r[2], r[1]) for r in self.trader.All_orders.values() if r[0]},
+            {("buy", Decimal(54)), ("sell", Decimal(60))},
+        )
+        self.venue.cancel_all_orders.assert_awaited_once()  # 仅用户停止时。
+
+    async def test_sell_edge_is_mirrored(self):
+        await self.normal_fills("sell", (61, 62))
+        preserved = self.owned().copy()
+        removed = {preserved["buy", Decimal(p)] for p in (57, 58, 59)}
+        self.fill("sell", 63)
+        await self.run_to_idle()
+        final = self.owned()
+        self.assertEqual(set(final),
+            {("buy", Decimal(p)) for p in (60, 61, 62)}
+            | {("sell", Decimal(p)) for p in (64, 65, 66)})
+        self.assertEqual(final["buy", Decimal(60)], preserved["buy", Decimal(60)])
+        self.assertEqual(final["buy", Decimal(61)], preserved["buy", Decimal(61)])
+        self.assertEqual({oid for batch in self.cancels for oid in batch}, removed)
+        self.assertEqual(sum(map(len, self.creates)), 4)
+
+    async def test_thirty_layers_use_two_create_batches_and_keep_fourteen_orders(self):
+        self.trader = GridTrader(self.venue, {**CONFIG, "gridLines": "30", "patch": "15"})
+        self.seed_grid()
+        await self.normal_fills("buy", range(59, 45, -1))
+        preserved = {
+            key: oid for key, oid in self.owned().items()
+            if key[0] == "sell" and key[1] <= 60
+        }
+        self.fill("buy", 45)
+        await self.run_to_idle()
+        self.assertEqual(len(preserved), 14)
+        self.assertEqual([len(batch) for batch in self.creates], [15, 1])
+        self.assertEqual([len(batch) for batch in self.cancels], [15])
+        self.assertEqual(len(self.owned()), 30)
+        self.assertTrue(all(self.owned()[key] == oid for key, oid in preserved.items()))
+
+    async def test_manual_orders_are_preserved_during_shift(self):
+        await self.normal_fills("buy", (59, 58))
+        self.venue.update_order(raw_order("777", price="63", ask=True))
+        self.fill("buy", 57)
+        await self.run_to_idle()
+        self.assertEqual(self.venue.orders["777"]["status"], "open")
+        self.assertNotIn("777", {oid for batch in self.cancels for oid in batch})
+        self.assertEqual(len(self.owned()), 6)
+
+    async def test_simultaneous_edges_keep_existing_reference_sort_priority(self):
+        self.fill("buy", 57)
+        self.fill("sell", 63)
+        await self.run_to_idle()
+        self.assertEqual(self.trader.myNewPrice, 63)
+        self.assertEqual(self.venue.filled_count, 2)
+        self.assertEqual(len(self.owned()), 6)
+
+    async def test_uncertain_shift_create_waits_for_verification_without_resending(self):
+        await self.normal_fills("buy", (59, 58))
+        edge_id = self.fill("buy", 57)
+        sample = submission_exchange()
+        self.venue.client = sample.client
+        self.venue._nonce, self.venue._nonce_generation = 100, self.venue.generation
+        self.venue.create_orders = LighterExchange.create_orders.__get__(self.venue)
+        started, release = asyncio.Event(), asyncio.Event()
+        sends = []
+
+        async def send(*args):
+            sends.append([item["order"]["id"] for item in self.trader.batch])
+            if len(sends) == 1:
+                raise TimeoutError()
+            await self.create([item["order"] for item in self.trader.batch])
+            return SimpleNamespace(code=200)
+
+        async def reconcile(ids, *, force_history):
+            self.assertTrue(force_history)
+            started.set()
+            await release.wait()
+            await self.create([item["order"] for item in self.trader.batch])
+
+        self.venue.client.send_tx_batch.side_effect = send
+        self.venue.reconcile = AsyncMock(side_effect=reconcile)
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            running = asyncio.create_task(self.run_to_idle())
+            try:
+                await asyncio.wait_for(started.wait(), timeout=2)
+                with self.assertRaises(asyncio.TimeoutError):
+                    await asyncio.wait_for(asyncio.Event().wait(), timeout=0.1)
+                self.assertEqual(self.trader.operation_kind, "verify")
+                self.assertIn(edge_id, self.trader.All_orders)
+                self.assertEqual(len(sends), 1)
+            finally:
+                release.set()
+                await running
+        self.assertEqual(len(sends), 2)
+        self.assertFalse(set(sends[0]) & set(sends[1]))
+        self.assertNotIn(edge_id, self.trader.All_orders)
+        self.assertEqual(self.venue.filled_count, 3)
+        self.assertEqual(len(self.owned()), 6)
+
+    async def test_coalesced_fills_fill_missing_slots_once(self):
+        for price in (59, 58, 57):
+            self.fill("buy", price)
+        await self.run_to_idle()
+        self.assertEqual(len(self.owned()), 6)
+        self.assertEqual(sum(map(len, self.creates)), 6)
+        self.assertEqual(self.venue.filled_count, 3)
+        self.assertEqual(self.trader.counter, 3)
+
+    async def test_queued_reversal_and_pending_order_are_not_duplicated(self):
+        await self.normal_fills("buy", (59,))
+        pending_id = self.owned()["sell", Decimal(60)]
+        self.venue.orders[pending_id]["status"] = "pending"
+        self.fill("buy", 58)
+        self.trader.replacements()
+        queued_id = self.trader.queue[0]["order"]["id"]
+        self.fill("buy", 57)
+        self.trader.replacements()
+        self.assertIn(queued_id, {item["order"]["id"] for item in self.trader.queue})
+        self.assertEqual(len(self.trader.queue), 5)
+        await self.run_to_idle()
+        self.assertEqual(self.owned()["sell", Decimal(60)], pending_id)
+        self.assertEqual(sum(map(len, self.creates)), 5)
+
+    async def test_edge_waits_for_inflight_batch_registration(self):
+        self.fill("buy", 59)
+        self.trader.replacements()
+        self.trader.batch = [self.trader.queue.popleft()]
+        order = self.trader.batch[0]["order"]
+        self.trader.operation_kind = "create"
+        self.trader.operation = asyncio.get_running_loop().create_future()
+        self.fill("buy", 58)
+        self.fill("buy", 57)
+        self.trader.replacements()
+        self.assertIsNone(self.trader.shift)
+        await self.create([order])
+        self.trader.operation.set_result(True)
+        self.trader.finish_operation()
+        self.creates.clear()
+        await self.run_to_idle()
+        self.assertEqual(self.owned()["sell", Decimal(60)], order["id"])
+
+    async def test_duplicate_edge_messages_do_not_repeat_shift(self):
+        await self.normal_fills("buy", (59, 58))
+        edge_id = self.fill("buy", 57)
+        self.trader.replacements()
+        shift = self.trader.shift
+        queued_ids = [item["order"]["id"] for item in self.trader.queue]
+        for _ in range(3):
+            self.venue.update_order(raw_order(edge_id, "filled", "57", "0"))
+            self.trader.replacements()
+            self.assertIs(self.trader.shift, shift)
+            self.assertEqual([item["order"]["id"] for item in self.trader.queue], queued_ids)
+        await self.run_to_idle()
+        self.venue.update_order(raw_order(edge_id, "filled", "57", "0"))
+        self.trader.replacements()
+        self.assertIsNone(self.trader.shift)
+        self.assertEqual(self.venue.filled_count, 3)
+
+    async def test_cancel_rate_limit_resumes_only_unfinished_chunk(self):
+        await self.normal_fills("buy", (59, 58))
+        self.fill("buy", 57)
+        failed = []
+
+        async def cancel(ids):
+            if len(self.cancels) == 1 and not failed:
+                failed.append(list(ids))
+                self.venue.budget.penalize(0.1)
+                raise RateLimitError("HTTP 429")
+            await self.cancel(ids)
+
+        self.venue.cancel_orders.side_effect = cancel
+        await self.run_to_idle()
+        calls = [call.args[0] for call in self.venue.cancel_orders.await_args_list]
+        self.assertEqual(list(map(len, calls)), [2, 1, 1])
+        self.assertEqual(calls[1], calls[2])
+        self.assertFalse(set(calls[0]) & set(calls[2]))
+        self.assertEqual(sum(map(len, self.creates)), 4)
+        self.assertIn("限速冷却", self.phases)
+
+    async def test_fill_racing_intentional_cancel_is_counted_without_rehanging(self):
+        await self.normal_fills("buy", (59, 58))
+        self.fill("buy", 57)
+        raced = []
+
+        async def cancel(ids):
+            if not raced:
+                oid = ids[0]
+                old = self.venue.orders[oid]
+                raced.append((oid, old["price"]))
+                self.venue.update_order(raw_order(
+                    oid, "filled", str(old["price"]), "0", ask=True,
+                ))
+            await self.cancel(ids)
+
+        self.venue.cancel_orders.side_effect = cancel
+        await self.run_to_idle()
+        self.assertEqual(self.venue.filled_count, 4)
+        self.assertEqual(len(self.owned()), 6)
+        self.assertEqual(sum(map(len, self.creates)), 4)
+        self.assertNotIn(("buy", raced[0][1] - 1), self.owned())
+
+    async def test_missing_cancel_terminal_keeps_ownership_for_late_fill(self):
+        await self.normal_fills("buy", (59, 58))
+        old_id = self.owned()["sell", Decimal(63)]
+        self.fill("buy", 57)
+
+        async def cancel(ids):
+            self.cancels.append(list(ids))
+            for oid in ids:
+                self.venue.orders.pop(oid, None)  # REST 已确认不活跃，WS 终态尚未到达。
+
+        self.venue.cancel_orders.side_effect = cancel
+        await self.run_to_idle()
+        self.assertIn(old_id, self.trader.retiring)
+        self.assertIn(old_id, self.trader.All_orders)
+        self.assertIn(old_id, self.venue._strategy_order_ids)
+        self.venue.update_order(raw_order(old_id, "filled", "63", "0", ask=True))
+        self.trader.replacements()
+        self.assertEqual(self.venue.filled_count, 4)
+        self.assertNotIn(old_id, self.trader.All_orders)
+        self.assertFalse(self.trader.queue)
+
+    async def test_external_partial_cancel_inside_new_grid_still_replaces_full_size(self):
+        await self.normal_fills("buy", (59, 58))
+        old_id = self.owned()["sell", Decimal(59)]
+        self.fill("buy", 57)
+        self.trader.replacements()
+        self.venue.update_order(raw_order(
+            old_id, "canceled-expired", "59", "0.4", ask=True,
+        ))
+        await self.run_to_idle()
+        new_id = self.owned()["sell", Decimal(59)]
+        self.assertNotEqual(new_id, old_id)
+        self.assertEqual(self.venue.orders[new_id]["amount"], 1)
+        self.assertEqual(self.venue.filled_count, 3)
+
+    async def test_new_edge_during_shift_is_processed_on_next_round(self):
+        await self.normal_fills("buy", (59, 58))
+        self.fill("buy", 57)
+        raced = []
+
+        async def cancel(ids):
+            if not raced:
+                raced.append(self.fill("sell", 60))
+            await self.cancel(ids)
+
+        self.venue.cancel_orders.side_effect = cancel
+        await self.run_to_idle()
+        self.assertEqual(self.trader.myNewPrice, 60)
+        self.assertEqual(set(self.owned()),
+            {("buy", Decimal(p)) for p in (57, 58, 59)}
+            | {("sell", Decimal(p)) for p in (61, 62, 63)})
+        self.assertEqual(self.venue.filled_count, 4)
+        self.venue.cancel_all_orders.assert_awaited_once()
+
+    async def test_retained_fill_during_shift_is_not_resurrected_at_old_side(self):
+        await self.normal_fills("buy", (59, 58))
+        self.fill("buy", 57)
+        raced = []
+
+        async def cancel(ids):
+            if not raced:
+                raced.append(self.fill("sell", 59))
+            await self.cancel(ids)
+
+        self.venue.cancel_orders.side_effect = cancel
+        await self.run_to_idle()
+        self.assertIn(("buy", Decimal(58)), self.owned())
+        self.assertNotIn(("sell", Decimal(59)), self.owned())
+        self.assertEqual(len(self.owned()), 6)
+
+    async def test_price_move_does_not_change_edge_anchor_and_invalid_extension_stops(self):
+        await self.normal_fills("buy", (59, 58))
+        self.fill("buy", 57)
+        self.venue.price = Decimal(88)
+        self.trader.replacements()
+        self.assertEqual(self.trader.myNewPrice, 57)
+        self.assertIn(("buy", Decimal(54)), {
+            (item["order"]["side"], item["order"]["price"]) for item in self.trader.queue
+        })
+        self.venue.market["min_quote_amount"] = "55"
+        with self.assertRaisesRegex(ValueError, "最小值"):
+            self.trader.shift_grid(Decimal(57))
+        self.venue.cancel_orders.assert_not_awaited()
+
+    async def test_account_risk_interrupts_shift_before_new_orders(self):
+        await self.normal_fills("buy", (59, 58))
+        self.fill("buy", 57)
+
+        async def cancel(ids):
+            await self.cancel(ids)
+            self.venue.stats = {"portfolio_value": "0"}
+
+        self.venue.cancel_orders.side_effect = cancel
+        self.trader.display = lambda: None
+        self.assertEqual(await asyncio.wait_for(self.trader.run(), timeout=2), 1)
+        self.assertFalse(self.creates)
+        self.venue.cancel_all_orders.assert_awaited_once()
+
+
+class SelectiveCancelTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.venue = submission_exchange()
+        self.signatures = []
+
+        def sign(**kwargs):
+            self.signatures.append(kwargs)
+            return 15, "{}", "cancel" + str(kwargs["nonce"]), None
+
+        self.venue.client.sign_cancel_order = sign
+        self.venue.fetch_orders = AsyncMock(return_value=[])
+        self.venue.reconcile = AsyncMock()
+
+    async def test_cancel_signs_client_id_and_confirms_without_extra_history(self):
+        self.venue.update_order(raw_order("11"))
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            await self.venue.cancel_orders(["11"])
+        self.assertEqual(self.signatures[0]["order_index"], 11)
+        self.assertEqual(self.venue.orders["11"]["order_index"], 1011)
+        self.venue.reconcile.assert_not_awaited()
+        self.assertEqual(self.venue.client.send_tx_batch.await_count, 1)
+
+    async def test_pending_order_is_not_confirmed_canceled_by_old_empty_snapshot(self):
+        order = self.venue.prepare_order("buy", 1, 59)
+        self.venue._register_pending([order])
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(FatalError):
+                await self.venue.cancel_orders([order["id"]])
+        self.assertEqual(self.venue.reconcile.await_count, 4)
+        self.assertEqual(self.venue.client.send_tx_batch.await_count, 1)
+
+    async def test_pending_cancel_requires_terminal_after_history_reports_open(self):
+        order = self.venue.prepare_order("buy", 1, 59)
+        self.venue._register_pending([order])
+        calls = []
+
+        async def reconcile(ids, *, force_history):
+            calls.append(list(ids))
+            self.assertTrue(force_history)
+            self.venue.update_order(raw_order(
+                order["id"], "open" if len(calls) == 1 else "canceled", price="59",
+            ))
+
+        self.venue.reconcile.side_effect = reconcile
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            await self.venue.cancel_orders([order["id"]])
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.venue.client.send_tx_batch.await_count, 1)
+
+    async def test_uncertain_cancel_is_verified_without_resend(self):
+        self.venue.update_order(raw_order("11"))
+        self.venue.client.send_tx_batch.side_effect = TimeoutError()
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            await self.venue.cancel_orders(["11"])
+        self.assertEqual(self.venue.client.send_tx_batch.await_count, 1)
+        self.venue.fetch_orders.assert_awaited_once()
+
+    async def test_cancel_lookup_cooldown_does_not_spend_confirmation_attempts(self):
+        self.venue.update_order(raw_order("11"))
+        self.venue.fetch_orders.side_effect = [RateLimitError("HTTP 429")] * 5 + [[]]
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            await self.venue.cancel_orders(["11"])
+        self.assertEqual(self.venue.fetch_orders.await_count, 6)
+        self.assertEqual(self.venue.client.send_tx_batch.await_count, 1)
+
+    async def test_cancel_rejection_racing_fill_is_resolved_by_active_query(self):
+        self.venue.update_order(raw_order("11"))
+        self.venue._strategy_order_ids.add("11")
+
+        async def send(*args):
+            self.venue.update_order(raw_order("11", "filled", remaining="0"))
+            self.venue.apply_message({"type": "update/account_tx", "txs": [
+                {"hash": "cancel100", "event_info": {"ae": "already filled"}},
+            ]})
+            return SimpleNamespace(code=200)
+
+        self.venue.client.send_tx_batch.side_effect = send
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            await self.venue.cancel_orders(["11"])
+        self.assertIsNone(self.venue.error)
+        self.assertEqual(self.venue.filled_count, 1)
+
+    async def test_rejected_cancel_that_stays_active_fails_closed(self):
+        self.venue.update_order(raw_order("11"))
+        self.venue.fetch_orders.return_value = [raw_order("11")]
+
+        async def send(*args):
+            self.venue.apply_message({"type": "update/account_tx", "txs": [
+                {"hash": "cancel100", "event_info": {"ae": "execution rejected"}},
+            ]})
+            return SimpleNamespace(code=200)
+
+        self.venue.client.send_tx_batch.side_effect = send
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(FatalError):
+                await self.venue.cancel_orders(["11"])
+        self.assertEqual(self.venue.client.send_tx_batch.await_count, 1)
+
+    async def test_terminal_orders_are_not_canceled_again(self):
+        self.venue.update_order(raw_order("11", "filled", remaining="0"))
+        self.venue.update_order(raw_order("12", "canceled"))
+        await self.venue.cancel_orders(["11", "12"])
+        self.venue.client.send_tx_batch.assert_not_awaited()
+
+    async def test_newer_stream_open_prevents_false_cancellation_confirmation(self):
+        self.venue.update_order(raw_order("11"))
+        calls = []
+
+        async def fetch(urgent=False):
+            calls.append(urgent)
+            if len(calls) == 1:
+                self.venue.update_order(raw_order("11"))
+            else:
+                self.venue.update_order(raw_order("11", "canceled"))
+            return []
+
+        self.venue.fetch_orders.side_effect = fetch
+        with patch("lighter_exchange.asyncio.sleep", new=AsyncMock()):
+            await self.venue.cancel_orders(["11"])
+        self.assertEqual(len(calls), 2)
 
 
 class QueryTests(unittest.IsolatedAsyncioTestCase):
